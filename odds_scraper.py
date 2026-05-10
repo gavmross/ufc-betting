@@ -310,7 +310,12 @@ def _build_fight(f1: dict, f2: dict) -> dict | None:
     if f1_odds and f2_odds:
         f1_avg = sum(f1_odds) / len(f1_odds)
         f2_avg = sum(f2_odds) / len(f2_odds)
-        p1, p2 = remove_vig(american_to_prob(f1_avg), american_to_prob(f2_avg))
+        # Average implied probabilities across books, not raw moneylines.
+        # Averaging moneylines breaks when books straddle even money
+        # (e.g., -115 and +110 average to -2.5 → 2.4% implied, not ~50%).
+        p1_raw = sum(american_to_prob(o) for o in f1_odds) / len(f1_odds)
+        p2_raw = sum(american_to_prob(o) for o in f2_odds) / len(f2_odds)
+        p1, p2 = remove_vig(p1_raw, p2_raw)
     else:
         f1_avg = f2_avg = None
         p1 = p2 = None

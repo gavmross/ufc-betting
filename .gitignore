@@ -9,6 +9,10 @@ __pycache__/
 # Logs
 *.log
 
+# API keys
+kaggle.json
+.env
+
 # OS
 .DS_Store
 Thumbs.db

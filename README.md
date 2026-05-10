@@ -3,9 +3,9 @@
 Scrapes [ufcstats.com](http://ufcstats.com) incrementally, engineers ML features
 with zero data leakage, and trains a gradient-boosted classifier to predict UFC fight outcomes.
 
-**Current model (ufc_model_20260509.pkl — 1,289-fight holdout):**
-- Pick accuracy: **75.8%** | AUC: **0.839** | Log loss: **0.498**
-- 75%+ confidence bucket: **88.0%** accuracy (676 fights)
+**Current model (ufc_model_20260509.pkl — 976-fight holdout, 2024-02-17 onward):**
+- Pick accuracy: **74.7%** | AUC: **0.834** | Log loss: **0.503**
+- 75%+ confidence bucket: **87.0%** accuracy (483 fights)
 
 ---
 
@@ -65,9 +65,9 @@ python model.py
 # Holdout accuracy, AUC, log loss by confidence bucket
 python backtest.py
 
-# Betting simulation (flat betting, default 2% edge threshold)
+# Betting simulation (flat betting, default 15% edge threshold)
 python bet_backtest.py
-python bet_backtest.py --threshold 0.10   # 10% minimum edge
+python bet_backtest.py --threshold 0.10   # override threshold
 ```
 
 ---
@@ -139,7 +139,8 @@ For each fight, features are built using only fights that occurred **before** th
 ### Model (`model.py`)
 - **Gradient Boosting Classifier** (scikit-learn) with `SimpleImputer → StandardScaler → GBM` pipeline
 - **GridSearchCV** over 54 hyperparameter combos × 7 temporal folds (scoring: neg_log_loss)
-- **Probability calibration** via Platt scaling (`CalibratedClassifierCV`) on a temporal holdout
+- **3-way temporal split**: 70% train (GBM + CV), 15% calibrate (Platt scaling), 15% holdout (evaluation only)
+- **Probability calibration** via Platt scaling (`CalibratedClassifierCV`) on the middle 15% — never sees the holdout
 - **Walk-forward cross-validation**: trains on past events, tests on future events — the only valid evaluation method for time-series sports data
 
 ---

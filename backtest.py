@@ -2,12 +2,16 @@ import sqlite3, pickle, numpy as np, pandas as pd
 from pathlib import Path
 from sklearn.metrics import log_loss, roc_auc_score
 
-models = sorted(Path("models").glob("ufc_model_*.pkl"))
+models = sorted(Path("models").glob("ufc_model_[0-9]*.pkl"))
 with open(models[-1], "rb") as f:
     artifact = pickle.load(f)
 
-pipeline    = artifact["pipeline"]
+pipeline     = artifact["pipeline"]
 feature_cols = artifact["features"]
+# Use the same split fractions the model was trained with.
+# Older artifacts (pre-3-way split) default to the old 80/20 behaviour.
+train_frac = artifact.get("train_frac", 0.80)
+calib_frac = artifact.get("calib_frac", 0.00)
 
 conn = sqlite3.connect("data/ufc.db")
 df = pd.read_sql("SELECT * FROM features ORDER BY event_date", conn)
@@ -15,8 +19,8 @@ conn.close()
 
 df = df.sort_values("event_date").dropna(subset=["label"])
 
-split   = int(len(df) * 0.8)
-holdout = df.iloc[split:].copy()
+holdout_start = int(len(df) * (train_frac + calib_frac))
+holdout = df.iloc[holdout_start:].copy()
 
 X = holdout[[c for c in feature_cols if c in holdout.columns]].fillna(0)
 for col in feature_cols:

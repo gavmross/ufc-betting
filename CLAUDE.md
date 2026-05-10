@@ -72,12 +72,12 @@ Fight N is added to the history. This is enforced by the sequential loop in
 without carefully preserving this ordering guarantee.
 
 **Feature construction:**
-- Rolling 5-fight averages per fighter: sig strikes landed/attempted, takedowns, control time, knockdowns, sub attempts
+- Rolling 7-fight averages per fighter: sig strikes landed/attempted, takedowns, control time, knockdowns, sub attempts
 - Derived rates: strike accuracy, TD accuracy, win rate, finish rate
 - Physical attributes from `fighters` table: height (inches), reach (inches), stance (one-hot)
 - All features are **differenced** (f1 - f2). This encodes relative advantage and makes the model symmetric — if you swap fighter order, the prediction flips correctly.
 
-**Rolling window:** `n_fights=5` is a hyperparameter. It's worth experimenting with 3, 7, and 10.
+**Rolling window:** `n_fights=7` (tested 3/5/7/10 — 7 wins on AUC).
 
 **Label balancing:** ufcstats.com always lists the winner as fighter_1. To prevent the model from learning a trivial "always pick f1" shortcut, fighter order is randomly swapped 50% of the time (seeded with `np.random.RandomState(42)` for reproducibility). Labels are flipped accordingly. Result: ~50/50 label balance.
 
@@ -143,12 +143,12 @@ new_elo  = old_elo + K * (actual - expected)
 - **Inactivity decay:** After 365 days of inactivity, a fighter's rating drifts toward the 1500 baseline at `DECAY_RATE = 0.01` per year. This represents uncertainty about current form after a long layoff.
 - Pre-fight Elo snapshot is taken **before** updating — no leakage.
 
-**Tunable hyperparameters** (top of `elo.py`):
+**Tunable hyperparameters** (top of `elo.py`, tuned via grid search):
 ```python
 BASE_RATING      = 1500
-K_BASE           = 20    # split decision (barely a win)
-K_DECISION_BONUS = 4     # added for U-DEC / M-DEC
-K_FINISH_BONUS   = 8     # added for KO/TKO / SUB
+K_BASE           = 28    # split decision (totals: split=28, dec=30, fin=32)
+K_DECISION_BONUS = 2     # added for U-DEC / M-DEC
+K_FINISH_BONUS   = 4     # added for KO/TKO / SUB
 SCALE            = 400
 DECAY_RATE       = 0.01
 DECAY_THRESHOLD  = 365
@@ -193,23 +193,30 @@ are used for the final model. Takes ~5-10 min with `n_jobs=-1`.
 **Probability calibration:**
 GBMs produce overconfident probabilities. After training, the pipeline is
 wrapped in `CalibratedClassifierCV` using Platt scaling (`method="sigmoid"`)
-on a temporal holdout (last 20% of data). This maps raw scores to true
-frequencies so "70%" means the fighter actually wins ~70% of the time.
+on a dedicated calibration set (middle 15% of data, never used for training
+or evaluation). This maps raw scores to true frequencies so "70%" means the
+fighter actually wins ~70% of the time.
 Uses `FrozenEstimator` to wrap the pre-fitted pipeline (sklearn 1.6+ API).
 
 **Walk-forward cross-validation (`walk_forward_cv`):**
-Splits data into temporal folds. Fold i trains on the first `i * fold_size`
-fights and tests on the next `fold_size`. This is the only correct evaluation
-strategy for time-series sports data — random splits cause data leakage
-(training on future fights to predict past fights). Each fold reports both
-raw and calibrated log loss to measure the calibration improvement.
+Splits the training set (first 70% of data) into temporal folds. Fold i trains
+on the first `i * fold_size` fights and tests on the next `fold_size`. This is
+the only correct evaluation strategy for time-series sports data — random splits
+cause data leakage. CV never sees the calibration set or the holdout.
 
 **Training flow (`train()`):**
-1. Run `walk_forward_cv()` (includes grid search) to find best params.
-2. Build pipeline with best params.
-3. Temporal split: first 80% for training, last 20% for calibration.
-4. Wrap in `CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")`.
-5. Save calibrated model.
+1. Split data into 3 temporal segments: `TRAIN_FRAC=0.70`, `CALIB_FRAC=0.15`, holdout=last 15%.
+2. Run `walk_forward_cv()` on the training set only (includes grid search) to find best params.
+3. Fit the full pipeline on the training set with best params.
+4. Fit `CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")` on the calibration set.
+5. Save calibrated model. Holdout is never touched.
+
+**Key constants:**
+```python
+TRAIN_FRAC = 0.70   # GBM training + walk-forward CV
+CALIB_FRAC = 0.15   # Platt scaling only
+# last 15% → holdout, evaluated in backtest.py / bet_backtest.py
+```
 
 **Prediction interface:**
 ```python
@@ -354,7 +361,7 @@ python model.py
 
 ---
 
-## Current Status (as of 2026-05-09)
+## Current Status (as of 2026-05-10)
 
 **What's done:**
 - Full scraping pipeline (incremental + backfill)
@@ -364,16 +371,20 @@ python model.py
 - Per-weight-class Elo with tuned K-factors: K_BASE=28, K_DECISION_BONUS=2, K_FINISH_BONUS=4 (totals: split=28, dec=30, fin=32)
 - `apply_decay` bug fixed — ratings already ≤ 1500 are no longer pulled upward
 - GBM with GridSearchCV hyperparameter tuning (54 combos × 7 temporal folds)
-- Probability calibration via Platt scaling (CalibratedClassifierCV + FrozenEstimator)
+- 3-way temporal split: 70% train (GBM + CV), 15% calibrate (Platt), 15% holdout (evaluation only) — CV and calibration never see the holdout
+- Probability calibration via Platt scaling (CalibratedClassifierCV + FrozenEstimator) on dedicated calibration set
+- Moneyline averaging bug fixed: averages implied probabilities across books (not raw American lines) before vig removal
+- Betting backtest default threshold set to 15% edge (best ROI/volume tradeoff from bucket analysis)
 - predict_fight() accepts `is_title_fight=True/False`, returns calibrated probs + age/layoff + stat profiles
 - `build_feature_dataframe` accepts `write_db=False` for in-memory experiments
-- `backtest.py` for holdout evaluation; `rolling_window_experiment.py` and `elo_tuning.py` for hyperparameter experiments
+- `backtest.py` for holdout evaluation; `bet_backtest.py` for betting simulation (flat betting, 15% edge default)
 
-**Current model metrics (ufc_model_20260509.pkl, 1,289 fight holdout):**
-- Pick accuracy: 75.8% | AUC: 0.839 | Log loss: 0.4980
-- 75%+ confidence bucket: 88.0% accuracy (676 fights)
+**Current model metrics (ufc_model_20260509.pkl, 976-fight holdout, 2024-02-17 onward):**
+- Pick accuracy: 74.7% | AUC: 0.834 | Log loss: 0.5028
+- 75%+ confidence bucket: 87.0% accuracy (483 fights)
 - Retrained with `diff_closing_prob`, sportsbook-only odds (Kalshi/Polymarket excluded)
 - Previous baseline (no odds feature): 73.2% / 0.793 / 0.5285
+- Betting backtest (15% edge, 189 bets): +39.9% ROI, max drawdown -6.94u
 
 **What needs to happen next:**
 - Style matchup encoding (wrestler vs striker) — requires fighter tagging

@@ -432,10 +432,16 @@ When you call `predict_fight("Israel Adesanya", "Joe Pyfer")`:
 
 ### What the final model trains on
 
-After CV is done, the final model trains on **all available data** (not just the
-last fold). This gives the model the most information possible for real
-predictions. The CV scores tell you roughly how well it generalizes, but the
-deployed model has seen everything.
+The data is split into three temporal segments:
+
+1. **Training set (first 70%)** — GBM is fitted here; walk-forward CV and grid
+   search also run on this portion only. CV scores are honest because the
+   calibration and holdout sets are never touched during this phase.
+2. **Calibration set (middle 15%)** — The fitted GBM is wrapped in
+   `CalibratedClassifierCV` (Platt scaling) here. This corrects the GBM's
+   overconfident raw scores into well-calibrated probabilities.
+3. **Holdout (last 15%)** — Used only in `backtest.py` and `bet_backtest.py`
+   for honest evaluation. Never seen during training or calibration.
 
 ---
 
@@ -503,7 +509,8 @@ source of error.
 ### Model assumptions
 
 13. **Probability calibration has limits.** The model applies Platt scaling
-    (`CalibratedClassifierCV`) on a temporal holdout, which maps raw GBM scores
+    (`CalibratedClassifierCV`) on a dedicated calibration set (middle 15% of
+    data, separate from the evaluation holdout), which maps raw GBM scores
     to better-calibrated probabilities. However, the model's probability
     distribution is still more dispersed than the market's (~0.31 std vs ~0.18
     std for closing line), so high-confidence outputs should be treated with
@@ -519,11 +526,12 @@ source of error.
     (GBMs do this via tree splits) but it has no explicit "wrestler vs striker"
     matchup feature.
 
-16. **Training on all data for the final model.** The walk-forward CV gives you
-    an honest estimate of performance on unseen fights, but the deployed model
-    is trained on everything including the test folds. This is standard practice
-    (you want the model to know as much as possible) but means the CV score is
-    an estimate, not a guarantee.
+16. **3-way temporal split.** The walk-forward CV runs on the first 70% of
+    data only, so the CV score isn't contaminated by calibration or holdout
+    fights. The middle 15% is used solely for Platt scaling. The final 15% is
+    a true holdout — never seen during training, grid search, or calibration.
+    The CV score is an honest generalization estimate, not inflated by leakage
+    into the holdout.
 
 17. **The model has limited concept of context.** Scheduled rounds (3 vs 5) are
     now used to normalize `avg_round_ended`, but other contextual factors —
@@ -535,7 +543,7 @@ source of error.
 The model captures the most important predictors of UFC outcomes (recent form,
 striking/grappling ability, physical attributes, opponent-adjusted skill via Elo,
 and closing odds consensus). It is probability-calibrated via Platt scaling and
-achieves 75.8% pick accuracy on a 1,289-fight holdout (AUC 0.839). Treat its
+achieves 74.7% pick accuracy on a 976-fight holdout (AUC 0.834). Treat its
 outputs as a calibrated starting point for analysis, bearing in mind that the
 probability distribution is wider than market consensus.
 

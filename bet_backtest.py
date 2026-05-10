@@ -1,12 +1,12 @@
 """
-Betting strategy backtest — flat betting, 2%+ edge threshold.
+Betting strategy backtest — flat betting, 15%+ edge threshold.
 
 Edge = model_prob - no_vig_closing_prob  (model vs fair market value)
 Payout = based on actual closing moneyline (with vig, avg across books)
 
 Usage:
-    python bet_backtest.py                    # default: 2% edge, flat
-    python bet_backtest.py --threshold 0.05   # 5% edge minimum
+    python bet_backtest.py                    # default: 15% edge, flat
+    python bet_backtest.py --threshold 0.10   # override threshold
 """
 
 import argparse, sqlite3, pickle
@@ -15,7 +15,7 @@ import pandas as pd
 from pathlib import Path
 
 
-EDGE_THRESHOLD_DEFAULT = 0.02
+EDGE_THRESHOLD_DEFAULT = 0.15
 
 
 def american_to_decimal(ml: float) -> float:
@@ -28,7 +28,7 @@ def american_to_decimal(ml: float) -> float:
 
 def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
     # ── Load model ────────────────────────────────────────────────────────────
-    models = sorted(Path("models").glob("ufc_model_*.pkl"))
+    models = sorted(Path("models").glob("ufc_model_[0-9]*.pkl"))
     with open(models[-1], "rb") as f:
         artifact = pickle.load(f)
 
@@ -49,8 +49,10 @@ def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
 
     # ── Holdout split (identical to backtest.py) ──────────────────────────────
     df = df.sort_values("event_date").dropna(subset=["label"])
-    split   = int(len(df) * 0.8)
-    holdout = df.iloc[split:].copy()
+    train_frac = artifact.get("train_frac", 0.80)
+    calib_frac = artifact.get("calib_frac", 0.00)
+    holdout_start = int(len(df) * (train_frac + calib_frac))
+    holdout = df.iloc[holdout_start:].copy()
 
     # ── Model predictions ─────────────────────────────────────────────────────
     X = holdout[[c for c in feature_cols if c in holdout.columns]].fillna(0)

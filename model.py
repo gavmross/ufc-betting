@@ -30,6 +30,20 @@ MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
 # ─────────────────────────────────────────────
+# TEMPORAL SPLIT FRACTIONS
+# ─────────────────────────────────────────────
+# 3-way split keeps the evaluation holdout completely isolated from
+# both hyperparameter tuning (CV) and probability calibration (Platt).
+#
+#   |──── 70% train ────|── 15% calibrate ──|── 15% holdout ──|
+#   CV runs here only       Platt scaling       Never touched
+#                                               until backtest.py
+#
+TRAIN_FRAC   = 0.70   # GBM training + walk-forward CV
+CALIB_FRAC   = 0.15   # Platt scaling calibration
+# holdout = 1 - TRAIN_FRAC - CALIB_FRAC = 0.15
+
+# ─────────────────────────────────────────────
 # HYPERPARAMETER GRID
 # ─────────────────────────────────────────────
 # 54 combos × 7 folds = 378 fits (~5-10 min with n_jobs=-1)
@@ -250,61 +264,73 @@ def train(db_path: Path = DB_PATH) -> object:
     """
     Train final model with tuned hyperparameters and probability calibration.
 
-    1. Load features, run walk-forward CV (includes grid search).
-    2. Build pipeline with best params from CV.
-    3. Temporal split: first 80% for training, last 20% for calibration.
-    4. Wrap trained pipeline in CalibratedClassifierCV (Platt scaling).
-    5. Save calibrated model artifact.
+    3-way temporal split (no data crosses boundaries):
+      1. First TRAIN_FRAC  (70%) — GBM training + walk-forward CV
+      2. Next  CALIB_FRAC  (15%) — Platt scaling calibration only
+      3. Final 15%              — held out; never seen until backtest.py
+
+    Walk-forward CV runs only on the training portion so hyperparameter
+    selection never sees calibration or holdout fights.
     """
     conn = sqlite3.connect(db_path)
     df = pd.read_sql("SELECT * FROM features ORDER BY event_date", conn)
     conn.close()
     df = df.sort_values("event_date").dropna(subset=["label"])
-    X, y = get_feature_matrix(df)
 
-    log.info(f"Training on {len(df)} fights, {X.shape[1]} features")
+    n         = len(df)
+    n_train   = int(n * TRAIN_FRAC)
+    n_calib   = int(n * CALIB_FRAC)
+    # holdout starts at n_train + n_calib (never touched here)
 
-    # Run walk-forward CV with grid search
-    cv_results = walk_forward_cv(df)
+    df_train = df.iloc[:n_train]
+    df_calib = df.iloc[n_train : n_train + n_calib]
+
+    X_train, y_train = get_feature_matrix(df_train)
+    X_calib, y_calib = get_feature_matrix(df_calib)
+
+    log.info(f"Total fights: {n}  |  train={n_train}, calib={n_calib}, "
+             f"holdout={n - n_train - n_calib}")
+    log.info(f"Holdout starts: {df.iloc[n_train + n_calib]['event_date']}")
+
+    # Walk-forward CV on training data only (hyperparameter tuning)
+    cv_results = walk_forward_cv(df_train)
     best_params = cv_results["best_params"]
     log.info(f"Using best params from CV: {best_params}")
 
-    # Build pipeline with tuned params
+    # Build and fit pipeline on training data
     pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
         ("clf", GradientBoostingClassifier(random_state=42)),
     ])
     pipeline.set_params(**best_params)
-
-    # Temporal split: 80% train, 20% calibration
-    split = int(len(df) * 0.8)
-    X_train, y_train = X.iloc[:split], y.iloc[:split]
-    X_calib, y_calib = X.iloc[split:], y.iloc[split:]
-    log.info(f"Train split: {len(y_train)} fights, Calibration split: {len(y_calib)} fights")
-
     pipeline.fit(X_train, y_train)
 
-    # Calibrate on temporal holdout (Platt scaling)
+    # Platt scaling on calibration set (separate from holdout)
     calibrated = CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")
     calibrated.fit(X_calib, y_calib)
 
     # Feature importance (from the inner pipeline's GBM)
     clf = pipeline.named_steps["clf"]
-    feat_imp = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    feat_imp = pd.Series(clf.feature_importances_, index=X_train.columns).sort_values(ascending=False)
     log.info("Top 10 features:\n" + feat_imp.head(10).to_string())
+
+    holdout_start_date = str(df.iloc[n_train + n_calib]["event_date"])
 
     # Save model
     model_path = MODEL_DIR / f"ufc_model_{datetime.now().strftime('%Y%m%d')}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
-            "pipeline": calibrated,
-            "features": list(X.columns),
-            "best_params": best_params,
-            "cv_results": cv_results,
-            "feat_importance": feat_imp.to_dict(),
-            "calibration_method": "sigmoid",
-            "trained_on": str(datetime.now()),
+            "pipeline":            calibrated,
+            "features":            list(X_train.columns),
+            "best_params":         best_params,
+            "cv_results":          cv_results,
+            "feat_importance":     feat_imp.to_dict(),
+            "calibration_method":  "sigmoid",
+            "trained_on":          str(datetime.now()),
+            "holdout_start_date":  holdout_start_date,
+            "train_frac":          TRAIN_FRAC,
+            "calib_frac":          CALIB_FRAC,
         }, f)
     log.info(f"Model saved to {model_path}")
     return calibrated, cv_results
@@ -315,8 +341,8 @@ def train(db_path: Path = DB_PATH) -> object:
 # ─────────────────────────────────────────────
 
 def load_latest_model():
-    """Load the most recently trained model."""
-    models = sorted(MODEL_DIR.glob("ufc_model_*.pkl"))
+    """Load the most recently trained production model (date-stamped, not experiment variants)."""
+    models = sorted(MODEL_DIR.glob("ufc_model_[0-9]*.pkl"))
     if not models:
         raise FileNotFoundError("No trained model found. Run train() first.")
     with open(models[-1], "rb") as f:
