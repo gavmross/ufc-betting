@@ -172,9 +172,10 @@ python model.py
 
 # Evaluate
 python backtest.py                              # holdout accuracy, AUC, log loss
-python bet_backtest.py                          # betting sim (15% edge, mkt >= 25%)
+python bet_backtest.py                          # flat-unit edge analysis (15% edge, mkt >= 25%)
 python bet_backtest.py --threshold 0.10         # override edge threshold
 python bet_backtest.py --min-market-prob 0.30   # stricter market filter
+python gen_equity.py                            # Quarter Kelly equity curve → equity_curve.png
 
 # Predict an upcoming fight
 python -c "from model import predict_fight; import json; print(json.dumps(predict_fight('Islam Makhachev', 'Charles Oliveira'), indent=2))"

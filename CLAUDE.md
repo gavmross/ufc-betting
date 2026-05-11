@@ -329,6 +329,13 @@ python features.py
 python elo.py
 python odds_scraper.py
 python model.py
+
+# Evaluate
+python backtest.py                              # holdout accuracy, AUC, log loss
+python bet_backtest.py                          # flat-unit edge analysis (15% edge, mkt >= 25%)
+python bet_backtest.py --threshold 0.10         # override edge threshold
+python bet_backtest.py --min-market-prob 0.30   # stricter market filter
+python gen_equity.py                            # Quarter Kelly equity curve → equity_curve.png
 ```
 
 ---
@@ -377,15 +384,16 @@ python model.py
 - Betting backtest default threshold set to 15% edge (best ROI/volume tradeoff from bucket analysis)
 - predict_fight() accepts `is_title_fight=True/False`, returns calibrated probs + age/layoff + stat profiles
 - `build_feature_dataframe` accepts `write_db=False` for in-memory experiments
-- `backtest.py` for holdout evaluation; `bet_backtest.py` for betting simulation (flat betting, 15% edge default, market prob >= 25% default)
-- `bet_backtest.py` flags: `--threshold` (edge), `--min-market-prob` (cuts extreme longshots; default 0.25 gives +44.7% ROI vs +39.9% unfiltered)
+- `backtest.py` for holdout evaluation; `bet_backtest.py` for flat-unit edge analysis (ROI per bet, edge buckets, market buckets); `gen_equity.py` for production Kelly simulation + equity curve
+- `bet_backtest.py` flags: `--threshold` (edge), `--min-market-prob` (cuts extreme longshots; default 0.25 gives +44.7% flat ROI vs +39.9% unfiltered)
+- Production betting strategy: Quarter Kelly sizing (`f* = (b·p − q)/b × 0.25`, capped at 15% per bet) — simulated in `gen_equity.py`
 
 **Current model metrics (ufc_model_20260509.pkl, 976-fight holdout, 2024-02-17 onward):**
 - Pick accuracy: 74.7% | AUC: 0.834 | Log loss: 0.5028
 - 75%+ confidence bucket: 87.0% accuracy (483 fights)
 - Retrained with `diff_closing_prob`, sportsbook-only odds (Kalshi/Polymarket excluded)
 - Previous baseline (no odds feature): 73.2% / 0.793 / 0.5285
-- Betting backtest (15% edge, 189 bets): +39.9% ROI, max drawdown -6.94u
+- Betting backtest (15% edge, mkt >= 25%, 174 bets): +44.7% flat ROI per bet; Quarter Kelly terminal $362,861 (+362,761%), max drawdown -51.7%
 
 **What needs to happen next:**
 - Style matchup encoding (wrestler vs striker) — requires fighter tagging
