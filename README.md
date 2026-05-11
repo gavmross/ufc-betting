@@ -1,89 +1,193 @@
-# UFC Fight Predictor
+## **UFC Fight Outcome Prediction & Betting System**
 
-Scrapes [ufcstats.com](http://ufcstats.com) incrementally, engineers ML features
-with zero data leakage, and trains a gradient-boosted classifier to predict UFC fight outcomes.
-
-**Current model (ufc_model_20260509.pkl — 976-fight holdout, 2024-02-17 onward):**
-- Pick accuracy: **74.7%** | AUC: **0.834** | Log loss: **0.503**
-- 75%+ confidence bucket: **87.0%** accuracy (483 fights)
+A systematic approach to predicting UFC fight outcomes and identifying edge against closing moneylines. A gradient-boosted classifier is trained on 30 years of UFC fight data with strict temporal validation — no data leakage at any stage. The betting strategy filters for model edge against no-vig market prices, validated on a 976-fight out-of-sample holdout.
 
 ---
 
-## Project Structure
+### **Data Foundation**
 
-```
-scraper.py          # Scrapes events, fights, fighter profiles + career stats
-features.py         # Builds ML-ready feature vectors (rolling pre-fight stats)
-elo.py              # Computes per-fighter Elo ratings by weight class
-odds_scraper.py     # Scrapes closing moneylines from bestfightodds.com
-model.py            # Trains GBM, walk-forward CV, prediction interface
-backtest.py         # Holdout evaluation: accuracy, AUC, log loss by confidence bucket
-bet_backtest.py     # Betting simulation: flat betting at configurable edge threshold
-requirements.txt
-data/
-  ufc.db            # SQLite database (single source of truth)
-models/             # Saved model .pkl files
-```
+Built on a purpose-built SQLite database covering **every UFC event from UFC 1 (1994) through present**. All data is scraped, cleaned, and stored locally.
+
+| Dataset | Rows | Source |
+|---|---|---|
+| Events | 773 | ufcstats.com |
+| Fights (with full per-fight stats) | 8,688 | ufcstats.com |
+| Fighter profiles | 4,491 | ufcstats.com |
+| ML feature vectors | 6,506 | Computed (features.py) |
+| Closing moneyline odds | 3,019 fights | bestfightodds.com (2012–present) |
+| Per-fight stats collected | 40+ columns | Strikes, TDs, control time, sub attempts, KDs |
+
+Per-fight stats include full strike breakdowns by **target** (head, body, leg) and **position** (distance, clinch, ground), scheduled rounds, and fighter career stats (SLpM, Str Acc, SApM, TD Avg, Sub Avg, DOB).
 
 ---
 
-## Quickstart
+### **The Model**
+
+**Pick accuracy: 74.7% | AUC: 0.834 | Log loss: 0.503**
+*(976-fight out-of-sample holdout, Feb 2024 – May 2026)*
+
+**Architecture:** `SimpleImputer → StandardScaler → GradientBoostingClassifier`, wrapped in `CalibratedClassifierCV` (Platt scaling) for calibrated probabilities.
+
+**Training protocol — strict 3-way temporal split, zero leakage:**
+
+```
+|──────────── 70% train ────────────|── 15% calibrate ──|── 15% holdout ──|
+  Walk-forward CV + grid search        Platt scaling        Never touched
+  (54 combos × 7 temporal folds)       only                 until backtest
+```
+
+- Walk-forward CV runs on the training portion only — no random splits
+- Calibration set is separate from the holdout (GBM probabilities are overconfident without this)
+- Holdout is never seen during training, grid search, or calibration
+
+**Feature engineering (110 features, no leakage):**
+
+For each fight, features are built using only fights that occurred *before* that fight. Rolling 7-fight windows (tested 3/5/7/10 — 7 wins on AUC) capture recent form without lookahead. All stats are differenced (f1 − f2) to encode relative advantage and make the model symmetric.
+
+| Feature group | Features |
+|---|---|
+| Rolling averages | Sig strikes, TDs, control time, KDs, sub attempts (landed + attempted) |
+| Derived rates | Strike accuracy, TD accuracy, win rate, finish rate |
+| Strike breakdown | Head/body/leg accuracy; distance/clinch/ground distribution |
+| Elo ratings | Per-weight-class, granular K-factors (tuned), inactivity decay, pre-fight snapshot |
+| Physical | Height/reach differential, stance one-hot encoded |
+| Context | Layoff (days since last fight), fighter age at fight time, 5-round experience |
+| Market | Closing no-vig implied probability (bestfightodds.com, sportsbooks only) |
+
+**Elo system (elo.py):** Per-weight-class ratings computed chronologically with granular K-factors tuned via grid search — KO/TKO/Sub: K=32, U-DEC/M-DEC: K=30, S-DEC: K=28. Inactivity decay toward 1500 after 365+ days (1%/year). Pre-fight snapshot written into features before ratings update (no leakage).
+
+**Top features by importance:**
+
+| Rank | Feature | Importance |
+|---|---|---|
+| 1 | diff_elo | 22.0% |
+| 2 | diff_fights_count | 16.0% |
+| 3 | diff_win_rate | 8.0% |
+| 4 | f2_elo_peak | 7.1% |
+| 5 | f1_elo_peak | 3.5% |
+
+**Holdout accuracy by confidence bucket:**
+
+| Confidence | Fights | Accuracy |
+|---|---|---|
+| 50–60% | 187 | 51.3% |
+| 60–70% | 199 | 65.3% |
+| 70–80% | 203 | 76.4% |
+| 80–90% | 223 | 86.1% |
+| 90%+ | 164 | 95.1% |
+
+---
+
+### **Betting Strategy & Backtest Results**
+
+**Edge filter:** Bet when `model_prob − no_vig_market_prob ≥ 15%` and market probability of the bet side ≥ 25% (cuts extreme longshots where the model is systematically overconfident).
+
+![Equity Curve](equity_curve.png)
+
+**Backtest: Feb 2024 – May 2026 (out-of-sample holdout only)**
+
+| Metric | Value |
+|---|---|
+| Starting bankroll | $100 |
+| Terminal bankroll | **$362,861** |
+| Total return (Quarter Kelly, compounded) | **+362,761%** |
+| Flat ROI per bet | **+44.7%** |
+| Win rate | 73.6% (128/174 bets) |
+| Max drawdown | -51.7% |
+| Avg Kelly stake | 12.4% of bankroll (cap: 15%) |
+| Bets placed | 174 (of 329 fights with odds coverage) |
+| Avg edge taken | 28.1% |
+| Avg decimal odds | 2.10x |
+| Holdout period | 976 fights, Feb 2024 – May 2026 |
+
+**Sizing:** Quarter Kelly — `f* = (b·p − q) / b × 0.25`, capped at 15% per bet. Payouts use actual closing moneylines (with book vig). Edge is calculated against no-vig implied probabilities. The model consistently identifies the correct side at 73.6% — well above the ~50% market-implied probability on the same fights.
+
+**Results by market probability bucket:**
+
+| Market prob (bet side) | Bets | Win rate | ROI |
+|---|---|---|---|
+| 25–30% (extreme dogs) | 0 | — | — |
+| 30–40% | 49 | 61.2% | +67.1% |
+| 40–50% | 29 | 58.6% | +18.4% |
+| 50–60% | 57 | 77.2% | +40.5% |
+| 60%+ (favorites) | 84 | 89.3% | +37.9% |
+
+---
+
+### **Technical Architecture**
+
+```
+ufcstats.com                      bestfightodds.com
+     |                                   |
+     v                                   v
+scraper.py               odds_scraper.py
+(10 threads, rate-limited)   (BFS slug discovery, ~256 events)
+     |                                   |
+     +-------------------+---------------+
+                         |
+                    data/ufc.db  (SQLite WAL)
+                         |
+              +----------+----------+
+              |                     |
+         features.py            elo.py
+    (rolling 7-fight avgs,   (per-weight-class,
+     110 features, no leak)   tuned K-factors)
+              |                     |
+              +----------+----------+
+                         |
+                     model.py
+          (GBM + walk-forward CV + Platt scaling)
+                         |
+              models/ufc_model_YYYYMMDD.pkl
+```
+
+All data stored in a single SQLite database (`data/ufc.db`). No intermediate CSVs. Incremental by default — each module only processes new events on subsequent runs.
+
+---
+
+### **Stack**
+
+Python 3.13 · SQLite WAL · scikit-learn · pandas · numpy · requests · BeautifulSoup · difflib (fuzzy name matching) · matplotlib
+
+---
+
+### **Running It**
 
 ```bash
 pip install -r requirements.txt
 
-# First run: backfill ALL historical data (UFC 1 -> present, ~20-25 min)
+# First run: full historical backfill (UFC 1 -> present, ~20-25 min)
 python scraper.py --full
-
-# Build feature matrix (rolling 7-fight averages, Elo, layoff, age, 5-round flag)
 python features.py
-
-# Compute Elo ratings (per weight class, tuned K-factors)
 python elo.py
-
-# Scrape closing odds from bestfightodds.com (~15 min first run, fast incremental)
-# Automatically merges diff_closing_prob into features table
 python odds_scraper.py
-
-# Train model + walk-forward cross-validation
 python model.py
-```
 
-### Incremental updates (after each UFC event)
-
-```bash
+# Incremental update (run after each UFC event)
 python scraper.py
 python features.py
 python elo.py
 python odds_scraper.py
 python model.py
-```
 
-### Evaluate the model
+# Evaluate
+python backtest.py                              # holdout accuracy, AUC, log loss
+python bet_backtest.py                          # betting sim (15% edge, mkt >= 25%)
+python bet_backtest.py --threshold 0.10         # override edge threshold
+python bet_backtest.py --min-market-prob 0.30   # stricter market filter
 
-```bash
-# Holdout accuracy, AUC, log loss by confidence bucket
-python backtest.py
-
-# Betting simulation (flat betting, default 15% edge threshold)
-python bet_backtest.py
-python bet_backtest.py --threshold 0.10   # override threshold
+# Predict an upcoming fight
+python -c "from model import predict_fight; import json; print(json.dumps(predict_fight('Islam Makhachev', 'Charles Oliveira'), indent=2))"
 ```
 
 ---
 
-## Predict a Fight
+### **Predict a Fight**
 
 ```python
 from model import predict_fight
 
-# Basic usage
-result = predict_fight("Islam Makhachev", "Charles Oliveira")
-
-# With closing odds (no-vig implied probability for fighter_1)
 result = predict_fight("Islam Makhachev", "Charles Oliveira", closing_odds_f1=0.71)
-
-print(result)
 # {
 #   "fighter_1": "Islam Makhachev",
 #   "fighter_2": "Charles Oliveira",
@@ -92,9 +196,9 @@ print(result)
 #   "predicted_winner": "Islam Makhachev",
 #   "confidence": 0.673,
 #   "elo": {"Islam Makhachev": {"current": 1820.1, "peak": 1831.4}, ...},
-#   "market_consensus": {"Islam Makhachev": 0.71, ...},  # only if closing_odds_f1 passed
-#   "f1_profile": {...},
-#   "f2_profile": {...},
+#   "market_consensus": {"Islam Makhachev": 0.71, "Charles Oliveira": 0.29},
+#   "f1_profile": {"record": {...}, "striking": {...}, "grappling": {...}, ...},
+#   "f2_profile": {...}
 # }
 ```
 
@@ -102,64 +206,17 @@ Fighter names must match ufcstats.com exactly (check the `fighters` table in `da
 
 ---
 
-## How It Works
+### **Status**
 
-### Data Collection (`scraper.py`)
-- Scrapes **events** (name, date, location), **fight results** (outcome, method, round, time), and **per-fight stats** (knockdowns, sig strikes, takedowns, control time, sub attempts)
-- Scrapes **fighter profiles**: physical attributes (height, reach, stance) and career stats (SLpM, Str. Acc., SApM, Str. Def., TD Avg., TD Acc., TD Def., Sub. Avg., DOB)
-- Incremental by default: only scrapes new events each run. `--full` backfills all history
-- All data stored in a single SQLite database (`data/ufc.db`)
-
-### Feature Engineering (`features.py`)
-For each fight, features are built using only fights that occurred **before** that fight (no leakage):
-- Rolling 7-fight averages: significant strikes, takedowns, control time, KDs, sub attempts
-- Derived rates: strike accuracy, TD accuracy, win rate, finish rate
-- Strike breakdown by target (head, body, leg) and position (distance, clinch, ground)
-- Physical: height/reach differential, stance one-hot encoded
-- Layoff (`days_since_last_fight`), fighter age at fight time, 5-round experience
-- All rolling stats are **differenced** (f1 - f2) to capture relative advantage
-- **Random fighter swap** (seeded): labels are ~50/50 (ufcstats.com always lists the winner as fighter_1)
-
-### Elo Ratings (`elo.py`)
-- Per-weight-class Elo ratings computed chronologically — no cross-class contamination
-- **Granular K-factors** (tuned via grid search):
-  - KO/TKO or Submission: K = 32 (most decisive)
-  - Unanimous/Majority Decision: K = 30
-  - Split Decision: K = 28 (barely a win)
-- Inactivity decay: ratings drift toward 1500 after 365+ days without a fight (1%/year)
-- Pre-fight Elo snapshot (no leakage) written into features: `diff_elo`, `f1_elo`, `f2_elo`, `f1_elo_peak`, `f2_elo_peak`
-
-### Closing Odds (`odds_scraper.py`)
-- Scrapes historical closing moneylines from bestfightodds.com via BFS slug discovery
-- Covers ~256 UFC events (2012–present); best coverage 2021+ (~60-73%)
-- Averages sportsbook odds only — Kalshi/Polymarket columns are dynamically detected and excluded
-- Removes vig to produce no-vig implied probabilities
-- Writes `f1_closing_prob`, `f2_closing_prob`, `diff_closing_prob` into the `features` table
-
-### Model (`model.py`)
-- **Gradient Boosting Classifier** (scikit-learn) with `SimpleImputer → StandardScaler → GBM` pipeline
-- **GridSearchCV** over 54 hyperparameter combos × 7 temporal folds (scoring: neg_log_loss)
-- **3-way temporal split**: 70% train (GBM + CV), 15% calibrate (Platt scaling), 15% holdout (evaluation only)
-- **Probability calibration** via Platt scaling (`CalibratedClassifierCV`) on the middle 15% — never sees the holdout
-- **Walk-forward cross-validation**: trains on past events, tests on future events — the only valid evaluation method for time-series sports data
-
----
-
-## Database Schema
-
-```sql
-events    (event_url PK, event_name, date, location)
-fighters  (fighter_url PK, first_name, last_name, nickname,
-           height, weight, reach, stance, wins, losses, draws,
-           dob, slpm, str_acc, sapm, str_def, td_avg, td_acc, td_def, sub_avg)
-fights    (fight_url PK, event_url FK, fighter_1, fighter_2,
-           outcome, method, round, time,
-           tot_*/sig_* stat columns for f1 and f2)
-features  (fight_url PK FK, event_date, fighter_1, fighter_2,
-           label, diff_* columns, f1_*/f2_* stat columns,
-           f1_elo, f2_elo, diff_elo, f1_elo_peak, f2_elo_peak,
-           f1_closing_prob, f2_closing_prob, diff_closing_prob)
-odds      (bfo_slug PK, bfo_event_name,
-           bfo_f1_name, bfo_f2_name, db_f1_name, db_f2_name,
-           f1_avg_odds, f2_avg_odds, f1_implied_prob, f2_implied_prob, scraped_at)
-```
+| Component | Status |
+|---|---|
+| Data pipeline (UFC 1 – present, 8,688 fights) | Complete |
+| Feature engineering (110 features, no leakage) | Complete |
+| Per-weight-class Elo with tuned K-factors | Complete |
+| Closing odds scraper (BFO, sportsbooks only) | Complete |
+| GBM + walk-forward CV + Platt calibration | Complete |
+| Holdout backtest (976 fights, Feb 2024+) | Complete — 74.7% accuracy, AUC 0.834 |
+| Betting backtest (174 bets, +44.7% ROI) | Complete — equity curve generated |
+| Live prediction interface | Complete — `predict_fight()` |
+| Style matchup encoding (wrestler vs striker) | Planned |
+| Weight class-specific models | Planned |

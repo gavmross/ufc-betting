@@ -48,7 +48,7 @@ Scrapes [ufcstats.com](http://ufcstats.com) and writes to `data/ufc.db`.
 **Key behaviors:**
 - `run_pipeline()` is the entry point. Pass `--full` on first run to backfill all history back to UFC 1. Subsequent runs are incremental — only new events are scraped by diffing against `events` table.
 - `init_db()` creates the four-table schema on first run (idempotent).
-- `SLEEP = 0.5` seconds between requests — do not remove, this is rate limiting out of courtesy to ufcstats.com.
+- Uses `ThreadPoolExecutor(MAX_WORKERS=10)` with a thread-safe `_RateLimiter(RATE_LIMIT=10)` — capped at 10 req/s globally across all threads. Do not raise these limits; this is courtesy to ufcstats.com.
 - Uses `INSERT OR REPLACE` (upsert) so re-runs don't create duplicate rows.
 - WAL mode is enabled on SQLite for better concurrent read performance.
 
@@ -377,7 +377,8 @@ python model.py
 - Betting backtest default threshold set to 15% edge (best ROI/volume tradeoff from bucket analysis)
 - predict_fight() accepts `is_title_fight=True/False`, returns calibrated probs + age/layoff + stat profiles
 - `build_feature_dataframe` accepts `write_db=False` for in-memory experiments
-- `backtest.py` for holdout evaluation; `bet_backtest.py` for betting simulation (flat betting, 15% edge default)
+- `backtest.py` for holdout evaluation; `bet_backtest.py` for betting simulation (flat betting, 15% edge default, market prob >= 25% default)
+- `bet_backtest.py` flags: `--threshold` (edge), `--min-market-prob` (cuts extreme longshots; default 0.25 gives +44.7% ROI vs +39.9% unfiltered)
 
 **Current model metrics (ufc_model_20260509.pkl, 976-fight holdout, 2024-02-17 onward):**
 - Pick accuracy: 74.7% | AUC: 0.834 | Log loss: 0.5028

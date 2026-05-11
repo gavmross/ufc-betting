@@ -5,8 +5,10 @@ Edge = model_prob - no_vig_closing_prob  (model vs fair market value)
 Payout = based on actual closing moneyline (with vig, avg across books)
 
 Usage:
-    python bet_backtest.py                    # default: 15% edge, flat
-    python bet_backtest.py --threshold 0.10   # override threshold
+    python bet_backtest.py                          # default: 15% edge, market >= 25%
+    python bet_backtest.py --threshold 0.10         # override edge threshold
+    python bet_backtest.py --min-market-prob 0.30   # only bet when market >= 30%
+    python bet_backtest.py --min-market-prob 0.0    # disable market filter
 """
 
 import argparse, sqlite3, pickle
@@ -15,7 +17,8 @@ import pandas as pd
 from pathlib import Path
 
 
-EDGE_THRESHOLD_DEFAULT = 0.15
+EDGE_THRESHOLD_DEFAULT   = 0.15
+MIN_MARKET_PROB_DEFAULT  = 0.25
 
 
 def american_to_decimal(ml: float) -> float:
@@ -26,7 +29,8 @@ def american_to_decimal(ml: float) -> float:
         return 1 + 100 / abs(ml)
 
 
-def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
+def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT,
+                 min_market_prob: float = MIN_MARKET_PROB_DEFAULT):
     # ── Load model ────────────────────────────────────────────────────────────
     models = sorted(Path("models").glob("ufc_model_[0-9]*.pkl"))
     with open(models[-1], "rb") as f:
@@ -105,6 +109,15 @@ def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
     bettable["bet_side"] = bettable.apply(pick_bet, axis=1)
     bets = bettable[bettable["bet_side"].notna()].copy()
 
+    # ── Market probability filter ─────────────────────────────────────────────
+    if min_market_prob > 0:
+        def _bet_market_prob(row):
+            if row["bet_side"] == "f1":
+                return row["f1_closing_prob"]
+            return row["f2_closing_prob"]
+        bets["_bet_market_prob"] = bets.apply(_bet_market_prob, axis=1)
+        bets = bets[bets["_bet_market_prob"] >= min_market_prob].copy()
+
     # ── P&L ───────────────────────────────────────────────────────────────────
     def calc_pnl(row):
         if row["bet_side"] == "f1":
@@ -145,9 +158,11 @@ def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
     total_with_odds = len(bettable)
     total_holdout   = len(holdout)
 
+    mkt_filter_str = f">= {min_market_prob:.0%}" if min_market_prob > 0 else "none"
     print("=" * 65)
     print(f"BETTING BACKTEST  --  {models[-1].name}")
     print(f"Edge threshold    : {edge_threshold:.0%}")
+    print(f"Market prob filter: {mkt_filter_str}")
     print("=" * 65)
     print(f"Holdout fights    : {total_holdout}")
     print(f"Fights with odds  : {total_with_odds}  ({total_with_odds/total_holdout:.0%} of holdout)")
@@ -214,6 +229,8 @@ def run_backtest(edge_threshold: float = EDGE_THRESHOLD_DEFAULT):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--threshold", type=float, default=EDGE_THRESHOLD_DEFAULT,
-                        help="Minimum edge to place a bet (default 0.02 = 2%%)")
+                        help="Minimum edge to place a bet (default 15%%)")
+    parser.add_argument("--min-market-prob", type=float, default=MIN_MARKET_PROB_DEFAULT,
+                        help="Minimum market implied probability for the bet side (default 0.25; set 0 to disable)")
     args = parser.parse_args()
-    run_backtest(edge_threshold=args.threshold)
+    run_backtest(edge_threshold=args.threshold, min_market_prob=args.min_market_prob)

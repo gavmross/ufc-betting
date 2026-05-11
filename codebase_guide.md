@@ -504,7 +504,7 @@ source of error.
 
 12. **Inactivity decay is linear and uniform.** A 365-day layoff due to injury
     is treated the same as a 365-day layoff due to suspension or choice.
-    The decay rate (5%/year) is a guess, not empirically optimized.
+    The decay rate (1%/year, `DECAY_RATE=0.01`) is a guess, not empirically optimized.
 
 ### Model assumptions
 
