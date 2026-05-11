@@ -112,6 +112,34 @@ For each fight, features are built using only fights that occurred *before* that
 | 50–60% | 57 | 77.2% | +40.5% |
 | 60%+ (favorites) | 84 | 89.3% | +37.9% |
 
+**Robustness check — ex-top-10 bets:**
+
+To test whether returns are driven by a handful of outliers, the top 10 bets by PnL were removed and the simulation was re-run on the remaining 164 bets.
+
+| | Full (174 bets) | Ex-top-10 (164 bets) |
+|---|---|---|
+| Flat ROI per bet | +44.7% | +33.3% |
+| Kelly terminal | $362,861 | $39,201 |
+
+The strategy remains highly profitable without the top 10 bets — +33.3% ROI and $39,201 terminal from $100. The edge is distributed across the full bet set, not concentrated in a few lucky wins.
+
+**Top 10 bets (all underdog wins, market prob 25–31%):**
+
+| Date | Fighter | Odds | Market | Model | Stake | PnL |
+|---|---|---|---|---|---|---|
+| 2026-04-25 | Eric McConico | 3.81x | 25% | 72% | 15.0% | +2.81u |
+| 2025-10-25 | Ciryl Gane | 3.74x | 28% | 45% | 6.1% | +2.74u |
+| 2025-03-15 | Roman Dolidze | 3.52x | 29% | 67% | 13.3% | +2.52u |
+| 2026-03-14 | Ion Cutelaba | 3.50x | 28% | 57% | 10.0% | +2.50u |
+| 2024-07-13 | Charles Johnson | 3.23x | 30% | 51% | 7.4% | +2.23u |
+| 2024-12-14 | Piera Rodriguez | 3.15x | 30% | 87% | 15.0% | +2.15u |
+| 2024-07-13 | Julian Erosa | 3.11x | 31% | 52% | 7.2% | +2.11u |
+| 2024-07-27 | Belal Muhammad | 3.08x | 30% | 47% | 5.5% | +2.08u |
+| 2025-10-18 | Djorden Santos | 3.05x | 31% | 87% | 15.0% | +2.05u |
+| 2025-07-12 | Derrick Lewis | 3.03x | 31% | 72% | 14.4% | +2.03u |
+
+All 10 are underdogs (25–31% market implied probability) that the model assigned significantly higher win probability than the market. The large PnL comes from long odds on correctly identified mispriced fighters — not from high-confidence chalk bets.
+
 ---
 
 ### **Technical Architecture**
