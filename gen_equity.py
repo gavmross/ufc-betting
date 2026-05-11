@@ -2,6 +2,7 @@ import sqlite3, pickle, numpy as np, pandas as pd, sys, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 from pathlib import Path
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -105,19 +106,10 @@ def kelly_f(p, dec_odds):
 
 bets["kelly_f"] = bets.apply(lambda r: kelly_f(r["model_prob"], r["decimal_odds"]), axis=1)
 
-bankroll_flat  = [STARTING_BANKROLL]
 bankroll_kelly = [STARTING_BANKROLL]
 kelly_used = []
 
 for _, row in bets.iterrows():
-    # flat 5%
-    stake_f = bankroll_flat[-1] * 0.05
-    if row["won"]:
-        bankroll_flat.append(bankroll_flat[-1] + stake_f * (row["decimal_odds"] - 1))
-    else:
-        bankroll_flat.append(bankroll_flat[-1] - stake_f)
-
-    # quarter kelly
     f = row["kelly_f"]
     kelly_used.append(f)
     stake_k = bankroll_kelly[-1] * f
@@ -126,84 +118,62 @@ for _, row in bets.iterrows():
     else:
         bankroll_kelly.append(bankroll_kelly[-1] - stake_k)
 
-dates = [bets["event_date"].iloc[0]] + list(bets["event_date"])
+dates     = [bets["event_date"].iloc[0]] + list(bets["event_date"])
 kelly_arr = np.array(bankroll_kelly)
-flat_arr  = np.array(bankroll_flat)
 peak_k    = np.maximum.accumulate(kelly_arr)
 dd_k      = (kelly_arr - peak_k) / peak_k * 100
-peak_f    = np.maximum.accumulate(flat_arr)
-dd_f      = (flat_arr - peak_f) / peak_f * 100
 
-print("=== Quarter Kelly vs 5% Flat ===")
-print(f"Quarter Kelly (cap {KELLY_CAP:.0%}): ${bankroll_kelly[-1]:,.0f}  ({(bankroll_kelly[-1]/STARTING_BANKROLL-1)*100:+.0f}%)")
-print(f"5% flat:                            ${bankroll_flat[-1]:,.0f}  ({(bankroll_flat[-1]/STARTING_BANKROLL-1)*100:+.0f}%)")
+n_bets   = len(bets)
+win_rate = bets["won"].mean()
+flat_roi = bets["pnl"].sum() / n_bets * 100
+final_k  = bankroll_kelly[-1]
+
+print(f"Quarter Kelly: ${final_k:,.0f}  ({(final_k/STARTING_BANKROLL-1)*100:+.0f}%)")
 print(f"Avg Kelly fraction: {np.mean(kelly_used):.1%}  (max {max(kelly_used):.1%})")
-print(f"Max drawdown (Kelly): {dd_k.min():.1f}%  |  (flat): {dd_f.min():.1f}%")
+print(f"Max drawdown: {dd_k.min():.1f}%")
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 1, figsize=(12, 9),
+fig, axes = plt.subplots(2, 1, figsize=(12, 8),
                          gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08})
 
 ax = axes[0]
-ax.set_facecolor("#0f1117")
-fig.patch.set_facecolor("#0f1117")
 
-for i in range(len(bets)):
-    color = "#26a641" if bets["won"].iloc[i] else "#da3633"
-    ax.axvline(x=bets["event_date"].iloc[i], color=color, alpha=0.13, linewidth=0.8)
+ax.fill_between(dates, STARTING_BANKROLL, kelly_arr,
+                color="#22c55e", alpha=0.15, zorder=2)
+ax.plot(dates, kelly_arr, color="#2563eb", linewidth=2.0, zorder=5)
+ax.axhline(STARTING_BANKROLL, color="#9ca3af", linewidth=0.8, linestyle=":", zorder=1)
 
-ax.plot(dates, bankroll_kelly, color="#58a6ff", linewidth=2.2, zorder=5,
-        label="Quarter Kelly (cap 15%)")
-ax.plot(dates, bankroll_flat,  color="#8b949e", linewidth=1.2, zorder=4,
-        linestyle="--", alpha=0.7, label="5% flat (reference)")
-ax.fill_between(dates, kelly_arr, peak_k, where=(kelly_arr < peak_k),
-                color="#da3633", alpha=0.15, zorder=3)
-ax.axhline(STARTING_BANKROLL, color="#ffffff", alpha=0.12, linewidth=0.8, linestyle=":")
+ax.annotate(f"  ${final_k:,.0f}",
+            xy=(dates[-1], final_k),
+            color="#2563eb", fontsize=11, fontweight="bold", va="center")
 
-final_k = bankroll_kelly[-1]
-ax.scatter([dates[-1]], [final_k], color="#3fb950", s=80, zorder=10)
-ax.annotate(f"  ${final_k:,.0f}\n  ({(final_k/STARTING_BANKROLL-1)*100:+.0f}%)",
-            xy=(dates[-1], final_k), color="#3fb950",
-            fontsize=10, fontweight="bold", va="center")
+title_line1 = "UFC Model — Quarter Kelly (0.25x, 15% cap)"
+title_line2 = (f"Feb 2024 – May 2026  ·  BestFightOdds Closing Lines  ·  $100 start"
+               f"  |  Win rate {win_rate:.1%}  |  {n_bets} bets  |  {flat_roi:+.1f}% ROI per bet")
+ax.set_title(f"{title_line1}\n{title_line2}", fontsize=11, pad=10)
 
-ax.set_title("UFC Model — Betting Equity Curve (Feb 2024 – May 2026)",
-             color="#c9d1d9", fontsize=13, fontweight="bold", pad=12)
-ax.set_ylabel("Bankroll ($)", color="#c9d1d9", fontsize=11)
-ax.tick_params(colors="#c9d1d9", labelsize=9)
-ax.spines[["top","right","bottom","left"]].set_color("#30363d")
-ax.yaxis.grid(True, color="#21262d", linewidth=0.8)
-ax.set_axisbelow(True)
+ax.set_ylabel("Bankroll ($)", fontsize=11)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
 ax.tick_params(axis="x", labelbottom=False)
 ax.set_xlim(dates[0], dates[-1])
-
-stats = (
-    f"Edge >= 15% | Market Prob >= 25% | Quarter Kelly sizing (cap 15%)\n"
-    f"174 bets  |  73.6% win rate  |  +44.7% flat ROI  |  "
-    f"Avg stake: {np.mean(kelly_used):.1%}  |  Max drawdown: {dd_k.min():.1f}%"
-)
-ax.text(0.01, 0.04, stats, transform=ax.transAxes,
-        color="#8b949e", fontsize=8.5, va="bottom",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="#161b22",
-                  edgecolor="#30363d", alpha=0.9))
-ax.legend(loc="upper left", facecolor="#161b22", edgecolor="#30363d",
-          labelcolor="#c9d1d9", fontsize=9)
+ax.yaxis.grid(True, color="#e5e7eb", linewidth=0.8)
+ax.set_axisbelow(True)
+ax.spines[["top", "right"]].set_visible(False)
 
 ax2 = axes[1]
-ax2.set_facecolor("#0f1117")
-ax2.fill_between(dates, dd_k, 0, color="#da3633", alpha=0.55)
-ax2.plot(dates, dd_k, color="#da3633", linewidth=1.0)
-ax2.plot(dates, dd_f, color="#8b949e", linewidth=0.8, linestyle="--", alpha=0.6)
-ax2.axhline(0, color="#30363d", linewidth=0.8)
-ax2.set_ylabel("Drawdown (%)", color="#c9d1d9", fontsize=10)
-ax2.tick_params(colors="#c9d1d9", labelsize=9)
-ax2.spines[["top","right","bottom","left"]].set_color("#30363d")
+ax2.fill_between(dates, dd_k, 0, color="#ef4444", alpha=0.4, zorder=2)
+ax2.plot(dates, dd_k, color="#ef4444", linewidth=1.0, zorder=3)
+ax2.axhline(0, color="#9ca3af", linewidth=0.8, zorder=1)
+ax2.set_ylabel("Drawdown", fontsize=10)
+ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
 ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
 ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-ax2.yaxis.grid(True, color="#21262d", linewidth=0.8)
+ax2.yaxis.grid(True, color="#e5e7eb", linewidth=0.8)
 ax2.set_axisbelow(True)
+ax2.spines[["top", "right"]].set_visible(False)
 ax2.set_xlim(dates[0], dates[-1])
+ax2.set_xlabel("Date", fontsize=11)
 plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
 
-plt.savefig("equity_curve.png", dpi=150, bbox_inches="tight",
-            facecolor="#0f1117", edgecolor="none")
+plt.savefig("equity_curve.png", dpi=150, bbox_inches="tight")
 print("Saved equity_curve.png")
