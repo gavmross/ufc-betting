@@ -94,6 +94,7 @@ For each fight, features are built using only fights that occurred *before* that
 | Flat ROI per bet | **+44.7%** |
 | Win rate | 73.6% (128/174 bets) |
 | Max drawdown | -51.7% |
+| Sharpe ratio | **3.60** (annualized, Kelly log returns) |
 | Avg Kelly stake | 12.4% of bankroll (cap: 15%) |
 | Bets placed | 174 (of 329 fights with odds coverage) |
 | Avg edge taken | 28.1% |

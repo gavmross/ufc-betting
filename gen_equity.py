@@ -128,9 +128,15 @@ win_rate = bets["won"].mean()
 flat_roi = bets["pnl"].sum() / n_bets * 100
 final_k  = bankroll_kelly[-1]
 
+years         = (bets["event_date"].max() - bets["event_date"].min()).days / 365.25
+bets_per_year = n_bets / years
+log_rets      = np.diff(np.log(kelly_arr))
+kelly_sharpe  = (log_rets.mean() / log_rets.std()) * np.sqrt(bets_per_year)
+
 print(f"Quarter Kelly: ${final_k:,.0f}  ({(final_k/STARTING_BANKROLL-1)*100:+.0f}%)")
 print(f"Avg Kelly fraction: {np.mean(kelly_used):.1%}  (max {max(kelly_used):.1%})")
 print(f"Max drawdown: {dd_k.min():.1f}%")
+print(f"Sharpe ratio: {kelly_sharpe:.2f}")
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(2, 1, figsize=(12, 8),
@@ -149,7 +155,7 @@ ax.annotate(f"  ${final_k:,.0f}",
 
 title_line1 = "UFC Model — Quarter Kelly (0.25x, 15% cap)"
 title_line2 = (f"Feb 2024 – May 2026  ·  BestFightOdds Closing Lines  ·  $100 start"
-               f"  |  Win rate {win_rate:.1%}  |  {n_bets} bets  |  {flat_roi:+.1f}% ROI per bet")
+               f"  |  Win rate {win_rate:.1%}  |  Sharpe {kelly_sharpe:.2f}  |  {n_bets} bets")
 ax.set_title(f"{title_line1}\n{title_line2}", fontsize=11, pad=10)
 
 ax.set_ylabel("Bankroll ($)", fontsize=11)
