@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -28,8 +29,8 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "ufc.db"
 
-MAX_WORKERS = 10   # concurrent request threads
-RATE_LIMIT  = 10   # max requests per second (shared across all threads)
+MAX_WORKERS = 4    # concurrent browser pages (reduced from 10; each page is a full browser tab)
+RATE_LIMIT  = 4    # max requests per second (keep courtesy throttle)
 
 # Map raw outcome text from ufcstats.com to clean values
 OUTCOME_MAP = {"W": "win", "L": "loss", "D": "draw", "NC": "nc"}
@@ -55,6 +56,29 @@ class _RateLimiter:
             self._last = time.time()
 
 _limiter = _RateLimiter(RATE_LIMIT)
+
+# ─────────────────────────────────────────────
+# PLAYWRIGHT BROWSER (one instance + page per thread)
+# ─────────────────────────────────────────────
+# Playwright's sync API uses greenlets internally and cannot cross thread
+# boundaries. Each thread must own its own playwright + browser + page trio.
+
+_thread_local = threading.local()
+_PW_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+def _get_page():
+    """Return a Playwright page for the current thread, creating one if needed."""
+    if not hasattr(_thread_local, "pw"):
+        _thread_local.pw      = sync_playwright().start()
+        _thread_local.browser = _thread_local.pw.chromium.launch(headless=True)
+        _thread_local.page    = _thread_local.browser.new_page(user_agent=_PW_UA)
+    elif _thread_local.page.is_closed():
+        _thread_local.page = _thread_local.browser.new_page(user_agent=_PW_UA)
+    return _thread_local.page
 
 
 # ─────────────────────────────────────────────
@@ -217,11 +241,55 @@ def init_db():
                 log.info(f"Added column {col} to fighters table")
 
 
-def get_soup(url: str) -> BeautifulSoup:
+# ufcstats.com fronts every page with a JavaScript proof-of-work interstitial
+# ("Checking your browser…"): it mines a SHA-256 nonce, POSTs it to /__c, gets a
+# clearance cookie, then calls location.reload() to serve the real page. Headless
+# Chromium runs this fine, but page.content() can capture the stub (or an
+# in-flight reload) instead of the real document. The clearance cookie is cached
+# on the browser context, so only the first request per thread pays this cost
+# (plus any later re-challenge).
+#
+# Predicate for "a real ufcstats page is now loaded". Absence of the challenge
+# marker is not enough: while the interstitial runs location.reload() the
+# document briefly becomes an empty <body> skeleton, and content() grabbed then
+# yields ~60 bytes that parse to nothing. Every real page has a populated body
+# with many top-level children (nav + content + footer + scripts); the stub has
+# ~2 and the skeleton has 0. readyState=="complete" pins it to the final load.
+_READY_PREDICATE = """() => {
+    const b = document.body;
+    if (!b) return false;
+    if ((b.innerText || '').includes('Checking your browser')) return false;
+    return document.readyState === 'complete' && b.children.length > 3;
+}"""
+
+
+def get_soup(url: str, deadline_s: float = 45.0) -> BeautifulSoup:
     _limiter.wait()
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    page = _get_page()
+    deadline = time.time() + deadline_s
+
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    while True:
+        remaining_ms = int((deadline - time.time()) * 1000)
+        if remaining_ms <= 0:
+            raise RuntimeError(f"anti-bot challenge did not clear for {url}")
+        try:
+            # Auto-retries the predicate across the challenge's reload navigation.
+            page.wait_for_function(_READY_PREDICATE, timeout=min(remaining_ms, 15000))
+            break
+        except PlaywrightTimeoutError:
+            # Challenge stuck (e.g. its /__c POST was rate-limited, so it never
+            # reloaded). Nudge it and retry until the overall deadline.
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+    return BeautifulSoup(page.content(), "html.parser")
 
 
 def parse_event_date(date_str: str) -> str:
@@ -456,13 +524,15 @@ def scrape_all_fighters(profile_urls: set | None = None) -> pd.DataFrame:
         profile_urls: If provided, only fetch individual profile pages for
             fighters whose URL is in this set. If None, fetch all profiles.
     """
-    # Phase 1: scrape all 26 listing pages in parallel
+    # Phase 1 runs sequentially — same race condition as event pages: concurrent
+    # Playwright browser launches across threads can silently return partial/empty
+    # tables (networkidle fires before the JS-rendered rows populate), which
+    # under-counts fighters without raising an error. 26 requests is cheap enough
+    # to just do one at a time.
     log.info("Scraping fighter listing pages (a-z)...")
     all_fighters = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        results = pool.map(_scrape_letter_page, "abcdefghijklmnopqrstuvwxyz")
-        for fighters_list in results:
-            all_fighters.extend(fighters_list)
+    for char in "abcdefghijklmnopqrstuvwxyz":
+        all_fighters.extend(_scrape_letter_page(char))
     log.info(f"Found {len(all_fighters)} fighters from listing pages")
 
     # Phase 2: scrape individual profiles in parallel
@@ -569,12 +639,11 @@ def run_pipeline(full_refresh: bool = False):
             f["event_location"] = ev_row["location"]
         return fights
 
+    # Phase 1 runs sequentially — event list pages are few (~5-10 per run) and
+    # parallel Playwright sessions have shown race conditions on first browser launch.
     all_fights = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_scrape_event_with_meta, ev): ev["event_name"] for ev in event_rows}
-        for future in as_completed(futures):
-            fights = future.result()
-            all_fights.extend(fights)
+    for ev in event_rows:
+        all_fights.extend(_scrape_event_with_meta(ev))
     log.info(f"Found {len(all_fights)} fights across {len(event_rows)} events")
 
     # ── Fights (Phase 2: scrape fight detail pages in parallel) ──
@@ -615,11 +684,12 @@ def run_pipeline(full_refresh: bool = False):
     with get_db() as conn:
         conn.execute("""
             UPDATE fights
-            SET event_date    = (SELECT e.date     FROM events e WHERE e.event_url = fights.event_url),
-                event_location = (SELECT e.location FROM events e WHERE e.event_url = fights.event_url)
+            SET event_name     = (SELECT e.event_name FROM events e WHERE e.event_url = fights.event_url),
+                event_date     = (SELECT e.date       FROM events e WHERE e.event_url = fights.event_url),
+                event_location = (SELECT e.location   FROM events e WHERE e.event_url = fights.event_url)
             WHERE EXISTS (SELECT 1 FROM events e WHERE e.event_url = fights.event_url)
         """)
-        log.info("Updated event_date and event_location on all fights from events table")
+        log.info("Updated event_name, event_date and event_location on all fights from events table")
 
     # ── Fighters ──
     # On incremental runs, only fetch profiles for fighters in new events

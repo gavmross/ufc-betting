@@ -256,6 +256,55 @@ def rolling_avg(history_list: list[dict], n_fights: int = 7) -> dict:
     return result
 
 
+def get_fighter_current_state(name: str, db_path: Path = DB_PATH, n_fights: int = 7):
+    """Return (rolling_stats_dict, last_fight_date) for a fighter's TRUE most
+    recent state, computed directly from their own full fight history.
+
+    Unlike reading the `features` table, this doesn't depend on whether the
+    opponent in each of their past fights also had prior UFC history —
+    build_feature_dataframe() only writes a row when BOTH fighters have
+    rolling stats (correct for training, since you can't compute a diff
+    against a debutant), which means a fighter's checkpoint silently goes
+    stale after fighting a UFC newcomer even though their own stats and
+    last-fight date obviously did update. Used by predict_fight() so live
+    picks always reflect each fighter's actual last fight, not their last
+    fight against someone with prior UFC data.
+    """
+    conn = sqlite3.connect(db_path)
+    fights_raw = pd.read_sql(
+        "SELECT * FROM fights WHERE (fighter_1 = ? OR fighter_2 = ?) AND outcome != ''",
+        conn, params=(name, name),
+    )
+    conn.close()
+    if fights_raw.empty:
+        return {}, None
+
+    fights = extract_fight_stats(fights_raw)
+    fights["event_date"] = pd.to_datetime(fights["event_date"], errors="coerce")
+    fights = fights.sort_values("event_date").reset_index(drop=True)
+
+    history = []
+    last_date = None
+    for _, row in fights.iterrows():
+        side = "f1" if row.get("fighter_1") == name else "f2"
+        outcome = row.get("outcome", "")
+        won = (side == "f1" and outcome == "win") or (side == "f2" and outcome == "loss")
+        entry = {
+            "date":   str(row.get("event_date", "")),
+            "won":    int(won),
+            "method": row.get("method", ""),
+            "round":  row.get("round", np.nan),
+            "scheduled_rounds": row.get("scheduled_rounds", np.nan),
+        }
+        for stat in STAT_COLS:
+            entry[stat] = row.get(f"{stat}_{side}", np.nan)
+        history.append(entry)
+        if pd.notna(row["event_date"]):
+            last_date = row["event_date"]
+
+    return rolling_avg(history, n_fights), last_date
+
+
 # ─────────────────────────────────────────────
 # BUILD ML DATAFRAME
 # ─────────────────────────────────────────────
@@ -307,6 +356,14 @@ def build_feature_dataframe(
         outcome = row.get("outcome", "")
 
         if not f1 or not f2 or pd.isna(f1) or pd.isna(f2):
+            continue
+
+        # Fight hasn't happened yet (scraped from an event card before results
+        # are posted) — no outcome to learn from and no stats to fold into
+        # rolling history. Skip entirely; predict_fight() reads each fighter's
+        # latest *completed* row for pre-fight stats, so this fight simply
+        # isn't in the features table until it's actually fought.
+        if not outcome:
             continue
 
         fight_dt = row["event_date"]

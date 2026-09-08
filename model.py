@@ -46,10 +46,17 @@ CALIB_FRAC   = 0.15   # Platt scaling calibration
 # ─────────────────────────────────────────────
 # HYPERPARAMETER GRID
 # ─────────────────────────────────────────────
-# 54 combos × 7 folds = 378 fits (~5-10 min with n_jobs=-1)
+# max_depth is fixed at 4 and excluded from the search. The CV folds are
+# dominated by pre-2021 data where closing odds are sparse, so the CV
+# loss function can't distinguish depth=2 from depth=4. Depth=4 is required
+# to capture interactions between diff_closing_prob and other features in
+# the holdout (2024+), where odds are widely available. Fixing depth prevents
+# the grid search from picking an under-powered model.
+# 18 combos × 7 folds = 126 fits (~2-4 min with n_jobs=-1)
+FIXED_MAX_DEPTH = 4
 PARAM_GRID = {
     "clf__n_estimators":  [100, 200, 300],
-    "clf__max_depth":     [2, 3, 4],
+    "clf__max_depth":     [FIXED_MAX_DEPTH],
     "clf__learning_rate": [0.01, 0.05, 0.1],
     "clf__subsample":     [0.8, 1.0],
 }
@@ -292,8 +299,11 @@ def train(db_path: Path = DB_PATH) -> object:
              f"holdout={n - n_train - n_calib}")
     log.info(f"Holdout starts: {df.iloc[n_train + n_calib]['event_date']}")
 
-    # Walk-forward CV on training data only (hyperparameter tuning)
-    cv_results = walk_forward_cv(df_train)
+    # Hyperparameter search over train+calib window so the grid search sees
+    # fights from 2021+ (where closing odds are available). The final model is
+    # still trained on df_train only; df_calib is used only for Platt scaling.
+    df_search = df.iloc[: n_train + n_calib]
+    cv_results = walk_forward_cv(df_search)
     best_params = cv_results["best_params"]
     log.info(f"Using best params from CV: {best_params}")
 
@@ -355,62 +365,72 @@ def predict_fight(
     db_path: Path = DB_PATH,
     is_title_fight: bool = False,
     closing_odds_f1: float | None = None,
+    debug: bool = False,
 ) -> dict:
     """
     Predict winner of an upcoming fight using each fighter's last known stats.
+
+    debug=True adds "_debug_X_pred" (the exact raw feature row fed to the
+    pipeline) and "_debug_feature_cols" to the returned dict, for offline
+    explainability (e.g. SHAP) without duplicating this function's row
+    construction logic elsewhere.
     """
     artifact = load_latest_model()
     pipeline = artifact["pipeline"]
     feature_cols = artifact["features"]
 
+    from features import get_fighter_current_state, parse_height, parse_reach
+
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql("SELECT * FROM features ORDER BY event_date", conn)
-    fighters_df = pd.read_sql("SELECT first_name, last_name, dob FROM fighters", conn)
+    fighters_df = pd.read_sql("SELECT first_name, last_name, dob, height, reach, stance FROM fighters", conn)
     conn.close()
 
     fighters_df["full_name"] = (
         fighters_df["first_name"].fillna("") + " " + fighters_df["last_name"].fillna("")
     ).str.strip()
-    dob_map = fighters_df.set_index("full_name")["dob"].to_dict()
+    fighters_df = fighters_df.set_index("full_name")
+    dob_map = fighters_df["dob"].to_dict()
 
-    def get_latest_stats(name: str, prefix: str) -> dict:
-        """Get most recent pre-fight stats for a fighter."""
-        as_f1 = df[df["fighter_1"] == name].sort_values("event_date").tail(1)
-        as_f2 = df[df["fighter_2"] == name].sort_values("event_date").tail(1)
-        row = as_f1.iloc[-1] if not as_f1.empty else (as_f2.iloc[-1] if not as_f2.empty else None)
-        if row is None:
-            return {}
+    STAT_KEYS = [
+        "win_rate", "finish_rate", "avg_sig_str_landed", "avg_sig_str_att",
+        "avg_td_landed", "avg_td_att", "avg_ctrl_secs", "avg_kd",
+        "avg_sub_att", "sig_str_acc", "td_acc", "avg_round_ended", "fights_count",
+        # strike targets
+        "head_acc", "body_acc", "leg_acc",
+        "avg_head_landed", "avg_body_landed", "avg_leg_landed",
+        # strike positions
+        "distance_pct", "clinch_pct", "ground_pct",
+        "avg_distance_landed", "avg_clinch_landed", "avg_ground_landed",
+        # control time fraction
+        "ctrl_pct", "five_round_exp",
+    ]
 
-        stat_keys = [
-            "win_rate", "finish_rate", "avg_sig_str_landed", "avg_sig_str_att",
-            "avg_td_landed", "avg_td_att", "avg_ctrl_secs", "avg_kd",
-            "avg_sub_att", "sig_str_acc", "td_acc", "avg_round_ended", "fights_count",
-            # strike targets
-            "head_acc", "body_acc", "leg_acc",
-            "avg_head_landed", "avg_body_landed", "avg_leg_landed",
-            # strike positions
-            "distance_pct", "clinch_pct", "ground_pct",
-            "avg_distance_landed", "avg_clinch_landed", "avg_ground_landed",
-            # control time fraction
-            "ctrl_pct",
-        ]
-        source_prefix = "f1" if not as_f1.empty else "f2"
-        stats = {}
-        for k in stat_keys:
-            col = f"{source_prefix}_{k}"
-            stats[f"{prefix}_{k}"] = row.get(col, np.nan)
+    def get_latest_stats(name: str, prefix: str):
+        """Get a fighter's TRUE current rolling stats and last-fight date,
+        computed from their own full fight history (see
+        features.get_fighter_current_state — this does NOT depend on
+        whether their past opponents also had prior UFC data, unlike
+        reading the sparse `features` table).
+        """
+        raw_stats, last_date = get_fighter_current_state(name, db_path)
+        if not raw_stats:
+            return {}, None
 
-        # Physical
-        for attr in ["height", "reach"]:
-            stats[f"{prefix}_{attr}"] = row.get(f"{source_prefix}_{attr}", np.nan)
+        stats = {f"{prefix}_{k}": raw_stats.get(k, np.nan) for k in STAT_KEYS}
 
-        for stance in ["Orthodox", "Southpaw", "Switch"]:
-            stats[f"{prefix}_stance_{stance}"] = row.get(f"{source_prefix}_stance_{stance}", 0)
+        if name in fighters_df.index:
+            frow = fighters_df.loc[name]
+            if isinstance(frow, pd.DataFrame):
+                frow = frow.iloc[0]
+            stats[f"{prefix}_height"] = parse_height(frow.get("height"))
+            stats[f"{prefix}_reach"] = parse_reach(frow.get("reach"))
+            for stance in ["Orthodox", "Southpaw", "Switch"]:
+                stats[f"{prefix}_stance_{stance}"] = 1 if frow.get("stance") == stance else 0
 
-        return stats
+        return stats, last_date
 
-    f1_stats = get_latest_stats(fighter_1, "f1")
-    f2_stats = get_latest_stats(fighter_2, "f2")
+    f1_stats, f1_last_fight = get_latest_stats(fighter_1, "f1")
+    f2_stats, f2_last_fight = get_latest_stats(fighter_2, "f2")
 
     if not f1_stats:
         return {"error": f"No data found for {fighter_1}"}
@@ -421,21 +441,35 @@ def predict_fight(
     try:
         from elo import compute_elo
         elo_df = compute_elo(db_path)
-        # Get most recent Elo snapshot for each fighter
-        def latest_elo(name, col):
-            fights_as_f1 = elo_df[elo_df.get("fight_url", pd.Series()).isin(
-                df[df["fighter_1"] == name]["fight_url"]
-            )]
-            fights_as_f2 = elo_df[elo_df.get("fight_url", pd.Series()).isin(
-                df[df["fighter_2"] == name]["fight_url"]
-            )]
-            combined = pd.concat([fights_as_f1, fights_as_f2])
-            return combined[col].iloc[-1] if not combined.empty else 1500.0
 
-        f1_elo      = latest_elo(fighter_1, "f1_elo")
-        f2_elo      = latest_elo(fighter_2, "f2_elo")
-        f1_elo_peak = latest_elo(fighter_1, "f1_elo_peak")
-        f2_elo_peak = latest_elo(fighter_2, "f2_elo_peak")
+        def get_own_elo(name):
+            """Return (current_elo, peak_elo) for a fighter using fights-table position.
+            elo_df stores f1_elo/f2_elo in fights-table order (f1=winner, f2=loser).
+            fights_f1/fights_f2 columns identify which fighter occupied each slot,
+            so we always read the column that corresponds to this fighter's slot.
+            """
+            as_f1 = elo_df[elo_df["fights_f1"] == name]
+            as_f2 = elo_df[elo_df["fights_f2"] == name]
+            # Collect (current_elo, peak_elo) from each appearance
+            records = []
+            if not as_f1.empty:
+                records.append(as_f1[["f1_elo", "f1_elo_peak"]].rename(
+                    columns={"f1_elo": "elo", "f1_elo_peak": "peak"}).iloc[-1])
+            if not as_f2.empty:
+                records.append(as_f2[["f2_elo", "f2_elo_peak"]].rename(
+                    columns={"f2_elo": "elo", "f2_elo_peak": "peak"}).iloc[-1])
+            if not records:
+                return 1500.0, 1500.0
+            # Most recent appearance (elo_df is chronological, take last row overall)
+            combined = pd.concat([
+                as_f1[["f1_elo", "f1_elo_peak"]].rename(columns={"f1_elo": "elo", "f1_elo_peak": "peak"}),
+                as_f2[["f2_elo", "f2_elo_peak"]].rename(columns={"f2_elo": "elo", "f2_elo_peak": "peak"}),
+            ]).sort_index()
+            last = combined.iloc[-1]
+            return float(last["elo"]), float(last["peak"])
+
+        f1_elo, f1_elo_peak = get_own_elo(fighter_1)
+        f2_elo, f2_elo_peak = get_own_elo(fighter_2)
     except Exception as e:
         log.warning(f"Could not load Elo ratings: {e}. Defaulting to 1500.")
         f1_elo = f2_elo = f1_elo_peak = f2_elo_peak = 1500.0
@@ -454,12 +488,15 @@ def predict_fight(
         "distance_pct", "clinch_pct", "ground_pct",
         "avg_distance_landed", "avg_clinch_landed", "avg_ground_landed",
         # control time fraction
-        "ctrl_pct",
+        "ctrl_pct", "five_round_exp",
     ]
+    # NaN (not 0) on a missing side — matches training, where an unknown diff
+    # is left NaN and filled by the pipeline's trained median imputer, rather
+    # than being asserted as "exactly tied."
     for k in stat_keys:
         v1 = f1_stats.get(f"f1_{k}", np.nan)
         v2 = f2_stats.get(f"f2_{k}", np.nan)
-        row[f"diff_{k}"] = (v1 - v2) if (not np.isnan(v1) and not np.isnan(v2)) else 0
+        row[f"diff_{k}"] = (v1 - v2) if (not np.isnan(v1) and not np.isnan(v2)) else np.nan
 
     # Elo features
     row["diff_elo"]    = f1_elo - f2_elo
@@ -468,7 +505,9 @@ def predict_fight(
     row["f1_elo_peak"] = f1_elo_peak
     row["f2_elo_peak"] = f2_elo_peak
 
-    # Age and layoff (computed relative to today)
+    # Age and layoff (computed relative to today). Layoff uses each fighter's
+    # TRUE last fight date from get_latest_stats/get_fighter_current_state —
+    # not a lookup into the sparse `features` table.
     today = datetime.now()
 
     def _current_age(name):
@@ -478,52 +517,36 @@ def predict_fight(
             return np.nan
         return (today - dob).days / 365.25
 
-    def _current_layoff(name):
-        as_f1 = df[df["fighter_1"] == name]["event_date"]
-        as_f2 = df[df["fighter_2"] == name]["event_date"]
-        all_dates = pd.concat([as_f1, as_f2])
-        if all_dates.empty:
+    def _layoff_from(last_fight_date):
+        if last_fight_date is None or pd.isna(last_fight_date):
             return np.nan
-        last_dt = pd.to_datetime(all_dates.max(), errors="coerce")
+        last_dt = pd.to_datetime(last_fight_date, errors="coerce")
         if pd.isna(last_dt):
             return np.nan
         return (today - last_dt.to_pydatetime()).days
 
     f1_age_val    = _current_age(fighter_1)
     f2_age_val    = _current_age(fighter_2)
-    f1_layoff_val = _current_layoff(fighter_1)
-    f2_layoff_val = _current_layoff(fighter_2)
+    f1_layoff_val = _layoff_from(f1_last_fight)
+    f2_layoff_val = _layoff_from(f2_last_fight)
 
     row["f1_age"]   = f1_age_val
     row["f2_age"]   = f2_age_val
-    row["diff_age"] = (f1_age_val - f2_age_val) if (not np.isnan(f1_age_val) and not np.isnan(f2_age_val)) else 0
+    row["diff_age"] = (f1_age_val - f2_age_val) if (not np.isnan(f1_age_val) and not np.isnan(f2_age_val)) else np.nan
     row["f1_days_since_last_fight"] = f1_layoff_val
     row["f2_days_since_last_fight"] = f2_layoff_val
-    row["diff_days_since_last_fight"] = (f1_layoff_val - f2_layoff_val) if (not np.isnan(f1_layoff_val) and not np.isnan(f2_layoff_val)) else 0
+    row["diff_days_since_last_fight"] = (f1_layoff_val - f2_layoff_val) if (not np.isnan(f1_layoff_val) and not np.isnan(f2_layoff_val)) else np.nan
 
     # 5-round fight flag
     row["is_5round_fight"] = 1 if is_title_fight else 0
 
-    # Closing odds: caller can pass current BFO moneyline as fighter_1's no-vig prob
-    # If not provided, defaults to 0 (= 50/50, no market information available)
+    # Closing odds: caller can pass current BFO moneyline as fighter_1's no-vig prob.
+    # If not provided, leave NaN so the trained imputer fills the population
+    # median rather than asserting a specific (and likely wrong) 50/50 market.
     if closing_odds_f1 is not None:
         row["diff_closing_prob"] = round(closing_odds_f1 - (1.0 - closing_odds_f1), 4)
     else:
-        row["diff_closing_prob"] = 0
-
-    # 5-round experience differential (from latest feature row)
-    def _5round_exp(name):
-        as_f1 = df[df["fighter_1"] == name].sort_values("event_date")
-        as_f2 = df[df["fighter_2"] == name].sort_values("event_date")
-        row_src = as_f1.tail(1) if not as_f1.empty else as_f2.tail(1)
-        if row_src.empty:
-            return np.nan
-        prefix = "f1" if not as_f1.empty else "f2"
-        return row_src.iloc[0].get(f"{prefix}_five_round_exp", np.nan)
-
-    f1_5r = _5round_exp(fighter_1)
-    f2_5r = _5round_exp(fighter_2)
-    row["diff_five_round_exp"] = (f1_5r - f2_5r) if (not np.isnan(f1_5r) and not np.isnan(f2_5r)) else 0
+        row["diff_closing_prob"] = np.nan
 
     for stance in ["Orthodox", "Southpaw", "Switch"]:
         row[f"f1_stance_{stance}"] = f1_stats.get(f"f1_stance_{stance}", 0)
@@ -600,6 +623,9 @@ def predict_fight(
             fighter_1: round(closing_odds_f1, 3),
             fighter_2: round(1.0 - closing_odds_f1, 3),
         }
+    if debug:
+        result["_debug_X_pred"] = X_pred
+        result["_debug_feature_cols"] = feature_cols
     return result
 
 

@@ -199,11 +199,20 @@ def compute_elo(db_path: Path = DB_PATH) -> pd.DataFrame:
             ratings[wc] = {}
             peaks[wc]   = {}
 
-        # Init fighters if first appearance
+        # Init fighters if first appearance in this weight class.
+        # If they already have an Elo in another weight class, carry over their
+        # best rating rather than starting from scratch. This handles fighters
+        # who move up/down in weight (e.g. Holloway going to Welterweight).
         for name in [f1, f2]:
             if name not in ratings[wc]:
-                ratings[wc][name] = BASE_RATING
-                peaks[wc][name]   = BASE_RATING
+                best = max(
+                    (ratings[other_wc][name]
+                     for other_wc in ratings
+                     if name in ratings[other_wc]),
+                    default=BASE_RATING,
+                )
+                ratings[wc][name] = best
+                peaks[wc][name]   = best
 
         # Apply inactivity decay before the fight
         for name in [f1, f2]:
@@ -218,6 +227,8 @@ def compute_elo(db_path: Path = DB_PATH) -> pd.DataFrame:
 
         elo_rows.append({
             "fight_url":    row["fight_url"],
+            "fights_f1":    f1,   # who is f1 in fights table (winner)
+            "fights_f2":    f2,   # who is f2 in fights table (loser)
             "f1_elo":       round(r1_pre, 2),
             "f2_elo":       round(r2_pre, 2),
             "diff_elo":     round(r1_pre - r2_pre, 2),
@@ -257,24 +268,67 @@ def compute_elo(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 
 def write_elo_to_db(elo_df: pd.DataFrame, db_path: Path = DB_PATH):
-    """Merge Elo values into the features table."""
+    """Merge Elo values into the features table, oriented to the FEATURES table's
+    fighter_1 / fighter_2.
+
+    compute_elo() emits Elo in fights-table order (f1 = winner, f2 = loser). But
+    features.py randomly swaps fighter order 50% of the time to balance labels,
+    flipping the label and every swap-aware diff_* feature with it. If the Elo
+    columns are written in winner-first order regardless, then sign(diff_elo) —
+    and f1_elo vs f2_elo — encodes *which fighter won*, i.e. the label leaks
+    straight into training. (This was a real bug: the model derived ~38% of its
+    feature importance from it and appeared to beat the closing line by ~0.15
+    log-loss out of sample.)
+
+    So: look up each fight's fighter_1 as stored in `features`; when it is the
+    loser (fights_f2), mirror the Elo columns before writing.
+
+    predict_fight() does not read these columns — it rebuilds the Elo features
+    itself from compute_elo() output in the caller's fighter order, which is
+    consistent with this features-order convention.
+    """
     ensure_elo_columns(db_path)
     with get_db(db_path) as conn:
+        feat_f1 = dict(conn.execute(
+            "SELECT fight_url, fighter_1 FROM features"
+        ).fetchall())
+
+        written = flipped = missing = mismatch = 0
         for _, row in elo_df.iterrows():
+            furl = row["fight_url"]
+            if furl not in feat_f1:
+                missing += 1
+                continue
+
+            if feat_f1[furl] == row["fights_f1"]:
+                f1e, f2e = row["f1_elo"], row["f2_elo"]
+                f1p, f2p = row["f1_elo_peak"], row["f2_elo_peak"]
+                de = row["diff_elo"]
+            elif feat_f1[furl] == row["fights_f2"]:
+                f1e, f2e = row["f2_elo"], row["f1_elo"]
+                f1p, f2p = row["f2_elo_peak"], row["f1_elo_peak"]
+                de = -row["diff_elo"]
+                flipped += 1
+            else:
+                # Name doesn't match either participant (cleaning drift) — write
+                # winner-first and count it so it's visible.
+                f1e, f2e = row["f1_elo"], row["f2_elo"]
+                f1p, f2p = row["f1_elo_peak"], row["f2_elo_peak"]
+                de = row["diff_elo"]
+                mismatch += 1
+
             conn.execute("""
                 UPDATE features
-                SET f1_elo      = ?,
-                    f2_elo      = ?,
-                    diff_elo    = ?,
-                    f1_elo_peak = ?,
-                    f2_elo_peak = ?
+                SET f1_elo = ?, f2_elo = ?, diff_elo = ?,
+                    f1_elo_peak = ?, f2_elo_peak = ?
                 WHERE fight_url = ?
-            """, (
-                row["f1_elo"], row["f2_elo"], row["diff_elo"],
-                row["f1_elo_peak"], row["f2_elo_peak"],
-                row["fight_url"],
-            ))
-    log.info(f"Elo written to features table in {db_path}")
+            """, (f1e, f2e, de, f1p, f2p, furl))
+            written += 1
+
+    log.info(f"Elo written to features: {written} rows "
+             f"({flipped} re-oriented to features order, "
+             f"{mismatch} name-mismatch kept winner-first, "
+             f"{missing} not in features table)")
 
 
 def run_elo_pipeline(db_path: Path = DB_PATH) -> pd.DataFrame:
