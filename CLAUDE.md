@@ -81,6 +81,8 @@ without carefully preserving this ordering guarantee.
 
 **Label balancing:** ufcstats.com always lists the winner as fighter_1. To prevent the model from learning a trivial "always pick f1" shortcut, fighter order is randomly swapped 50% of the time (seeded with `np.random.RandomState(42)` for reproducibility). Labels are flipped accordingly. Result: ~50/50 label balance.
 
+> ⚠️ **Every column written into the `features` table must respect this swap.** The rolling diffs, age, and layoff are computed in the swapped frame here. `elo.py` computes Elo in fights-table order (winner first) and must re-orient before writing — see `write_elo_to_db`. If it doesn't, `sign(diff_elo)` becomes a label leak. This bug shipped once; don't reintroduce it.
+
 **Label:** `1` if fighter_1 won (`outcome == "win"`), `0` otherwise. Draws and No Contests are excluded from training.
 
 ---
@@ -141,7 +143,8 @@ new_elo  = old_elo + K * (actual - expected)
   - `S-DEC` → `K_BASE = 20` (one judge disagreed on the winner)
   - `DQ`, `Overturned`, `CNC`, `Other` → no rating update (non-competitive)
 - **Inactivity decay:** After 365 days of inactivity, a fighter's rating drifts toward the 1500 baseline at `DECAY_RATE = 0.01` per year. This represents uncertainty about current form after a long layoff.
-- Pre-fight Elo snapshot is taken **before** updating — no leakage.
+- Pre-fight Elo snapshot is taken **before** updating — no *temporal* leakage.
+- **Orientation matters too.** `compute_elo()` emits `fights_f1`/`fights_f2` (winner/loser) plus Elo values in that order. `write_elo_to_db()` looks up each fight's `fighter_1` as stored in the `features` table and, when `features.py` swapped it to the loser, mirrors `f1_elo↔f2_elo`, `f1_elo_peak↔f2_elo_peak`, and negates `diff_elo` before writing. Skipping this re-orientation makes `sign(diff_elo)` a direct label leak (it was, until 2026-09-07). `predict_fight()` doesn't touch these columns — it rebuilds the Elo features itself in caller order via `get_own_elo`.
 
 **Tunable hyperparameters** (top of `elo.py`, tuned via grid search):
 ```python
@@ -344,19 +347,21 @@ python gen_equity.py                            # Quarter Kelly equity curve →
 
 | Gap | Why it matters | Fix |
 |---|---|---|
-| ~~No pre-fight betting odds~~ | ~~Closing line is a strong predictor and the best benchmark to beat~~ | ✅ Done — `odds_scraper.py` scrapes bestfightodds.com; `diff_closing_prob` added as feature; AUC 0.793 → 0.835 |
+| **No feature with genuine edge over the closing line** | After fixing the Elo leak (see below), the model does not beat the market and the betting strategy loses money. This is the core open problem. | Unsolved — needs signal the closing line doesn't already price in |
+| ~~No pre-fight betting odds~~ | ~~Closing line is a strong predictor and the best benchmark to beat~~ | ✅ Done — `odds_scraper.py` scrapes bestfightodds.com; `diff_closing_prob` added as feature (importance only ~3% in the leak-free model) |
 | ~~No layoff/days-since-last-fight feature~~ | ~~Long inactivity is a meaningful signal~~ | ✅ Done — `diff_days_since_last_fight`, `f1/f2_days_since_last_fight` |
 | ~~No fighter age at fight time~~ | ~~Decline curves are real~~ | ✅ Done — `diff_age`, `f1/f2_age` |
 | Style matchups not encoded | Wrestler vs striker is invisible to the model | Would require tagging fighters by style (manual or NLP on bios) |
 | ~~No title fight flag~~ | ~~Both affect fight dynamics~~ | ✅ Done — `is_5round_fight` + `diff_five_round_exp` (proxy: scheduled_rounds == 5) |
 | ~~Elo K-factor values not tuned~~ | ~~Granular K-factors by method are implemented but values were defaults~~ | ✅ Done — grid searched; best: K_BASE=28, K_DECISION_BONUS=2, K_FINISH_BONUS=4 (totals: 28/30/32) |
-| ~~Rolling window fixed at 5~~ | ~~Arbitrary — may not be optimal~~ | ✅ Done — tested 3/5/7/10; n=7 wins (AUC 0.7999, log loss 0.5496) |
+| ~~Rolling window fixed at 5~~ | ~~Arbitrary — may not be optimal~~ | ✅ Done — tested 3/5/7/10; n=7 wins |
+| ~~Elo label leak in `features` table~~ | ~~`elo.py` wrote Elo columns in winner-first order, ignoring `features.py`'s 50% swap → `sign(diff_elo)` leaked the label. Inflated holdout accuracy to ~79% and produced fake backtest returns.~~ | ✅ Fixed — `write_elo_to_db` now orients Elo columns to the swapped `features` order. Real holdout accuracy dropped to 62.5%, AUC 0.68. |
 
 ---
 
 ## Design Principles
 
-1. **No data leakage.** Every feature must be computable from fights that occurred strictly before the fight being predicted. This is enforced chronologically in `features.py` and `elo.py`. Never use random train/test splits on this dataset.
+1. **No data leakage.** Every feature must be computable from fights that occurred strictly before the fight being predicted. This is enforced chronologically in `features.py` and `elo.py`. Never use random train/test splits on this dataset. *Leakage is also about orientation, not just time:* `features.py` randomly swaps `fighter_1`/`fighter_2` 50% of the time, so any column merged in afterwards (Elo, odds) must be written in that same swapped order — otherwise its sign encodes the label. A leak of exactly this kind (Elo columns written winner-first) went undetected for months and produced a fake market-beating model.
 
 2. **Incremental by default.** The scraper only fetches new events on each run. This keeps runtime short and is polite to ufcstats.com.
 
@@ -368,16 +373,19 @@ python gen_equity.py                            # Quarter Kelly equity curve →
 
 ---
 
-## Current Status (as of 2026-05-10)
+## Current Status (as of 2026-09-07)
 
 **What's done:**
-- Full scraping pipeline (incremental + backfill)
+- Full scraping pipeline (incremental + backfill), now via Playwright headless Chromium
+  because ufcstats.com fronts every page with a JS proof-of-work interstitial that plain
+  `requests` can't clear. `rescrape_missing_stats.py` repairs fights whose detail pages
+  were missed during the anti-bot outage.
 - Feature engineering with rolling 7-fight averages (tested 3/5/7/10 — 7 wins), strike targets/positions, control time pct
 - Layoff feature (`days_since_last_fight`) and fighter age at fight time — both in model
 - Title/main-event flag (`is_5round_fight`) + 5-round experience (`five_round_exp`)
 - Per-weight-class Elo with tuned K-factors: K_BASE=28, K_DECISION_BONUS=2, K_FINISH_BONUS=4 (totals: split=28, dec=30, fin=32)
 - `apply_decay` bug fixed — ratings already ≤ 1500 are no longer pulled upward
-- GBM with GridSearchCV hyperparameter tuning (54 combos × 7 temporal folds)
+- GBM with GridSearchCV hyperparameter tuning (18 combos × 7 temporal folds; max_depth fixed at 4)
 - 3-way temporal split: 70% train (GBM + CV), 15% calibrate (Platt), 15% holdout (evaluation only) — CV and calibration never see the holdout
 - Probability calibration via Platt scaling (CalibratedClassifierCV + FrozenEstimator) on dedicated calibration set
 - Moneyline averaging bug fixed: averages implied probabilities across books (not raw American lines) before vig removal
@@ -385,15 +393,21 @@ python gen_equity.py                            # Quarter Kelly equity curve →
 - predict_fight() accepts `is_title_fight=True/False`, returns calibrated probs + age/layoff + stat profiles
 - `build_feature_dataframe` accepts `write_db=False` for in-memory experiments
 - `backtest.py` for holdout evaluation; `bet_backtest.py` for flat-unit edge analysis (ROI per bet, edge buckets, market buckets); `gen_equity.py` for production Kelly simulation + equity curve
-- `bet_backtest.py` flags: `--threshold` (edge), `--min-market-prob` (cuts extreme longshots; default 0.25 gives +44.7% flat ROI vs +39.9% unfiltered)
-- Production betting strategy: Quarter Kelly sizing (`f* = (b·p − q)/b × 0.25`, capped at 15% per bet) — simulated in `gen_equity.py`
+- `bet_backtest.py` flags: `--threshold` (edge), `--min-market-prob` (cuts extreme longshots)
+- Betting sims: `gen_equity.py` (full-holdout Quarter Kelly + equity curve), `ytd_backtest.py` (date-windowed bankroll sim; aborts if the window predates the model's holdout)
+- **Elo label leak found and fixed (2026-09-07).** `elo.py::write_elo_to_db` wrote `f1_elo/f2_elo/diff_elo/*_elo_peak` in fights-table (winner-first) order while `features.py` had randomly swapped fighter order — so `sign(diff_elo)` leaked the label. It was ~38% of feature importance. All models dated before `20260907` are leak-trained; `models/ufc_model_20260509.pkl` (tracked in git) is one of them.
 
-**Current model metrics (ufc_model_20260509.pkl, 976-fight holdout, 2024-02-17 onward):**
-- Pick accuracy: 74.7% | AUC: 0.834 | Log loss: 0.5028
-- 75%+ confidence bucket: 87.0% accuracy (483 fights)
-- Retrained with `diff_closing_prob`, sportsbook-only odds (Kalshi/Polymarket excluded)
-- Previous baseline (no odds feature): 73.2% / 0.793 / 0.5285
-- Betting backtest (15% edge, mkt >= 25%, 174 bets): +44.7% flat ROI per bet; Quarter Kelly terminal $362,861 (+362,761%), max drawdown -51.7%
+**Current model metrics (ufc_model_20260907.pkl, leak-free):**
+- Holdout (997 fights, 2024-05-11 → 2026-09-05): pick accuracy 62.5% | AUC 0.680 | log loss 0.644
+- Walk-forward CV: pick accuracy 55.1% | AUC 0.584 | prob accuracy 50.3% (≈ coin-flip)
+- Usable discrimination only in the 65%+ confidence buckets (76–78% there); ~50–57% below that
+- Model log loss 0.64 vs market log loss 0.58 on the same holdout fights — **does not beat the closing line**
+
+**Betting backtest (leak-free model, 15% edge, mkt ≥ 25%):**
+- Full holdout: 73 bets, 31.5% win rate, flat ROI −29.0%; Quarter Kelly $100 → $15 (−85%), max drawdown −89.6%, Sharpe −1.61
+- YTD 2026 (Jan–Sep): 28 bets, 17.9% win rate, flat ROI −60.1%; Quarter Kelly $100 → $26 (−73.8%)
+- Every edge bucket and both favorite/underdog slices are negative. The edge signal is anti-predictive.
+- Prior README/docs figures (+362,761%, 74.7% acc, AUC 0.834) were entirely the Elo leak.
 
 **What needs to happen next:**
 - Style matchup encoding (wrestler vs striker) — requires fighter tagging

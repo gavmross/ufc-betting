@@ -543,7 +543,12 @@ source of error.
 The model captures the most important predictors of UFC outcomes (recent form,
 striking/grappling ability, physical attributes, opponent-adjusted skill via Elo,
 and closing odds consensus). It is probability-calibrated via Platt scaling and
-achieves 74.7% pick accuracy on a 976-fight holdout (AUC 0.834). Treat its
-outputs as a calibrated starting point for analysis, bearing in mind that the
-probability distribution is wider than market consensus.
+achieves **62.5% pick accuracy on a 997-fight holdout (AUC 0.680)**. It has usable
+discrimination only in its 65%+ confidence buckets and **does not beat the closing
+line** (model holdout log loss 0.64 vs market 0.58). Treat its outputs as a
+calibrated starting point for analysis, not as a betting edge — the edge-filtered
+strategy loses money in backtest.
+
+*(An earlier version of this guide cited 74.7% / AUC 0.834. Those numbers came from
+a label leak in the Elo features, fixed 2026-09-07 — see CLAUDE.md.)*
 
